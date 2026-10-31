@@ -1,0 +1,10 @@
+PlumSpirit v1.0.0 — packaging notes
+
+The supplied `PlumSpirit.exe` was preserved byte-for-byte (SHA-256: 1ef1365d92bb60b654581f08f95ca61e31e889709330f3760a0a3f327bceab70).
+The official owner's supplied `GeneralUser-GS.sf2` is bundled next to the executable under SoundFonts/, matching size 32,319,396 and SHA-256 9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe.
+
+The SoundFont author S. Christian Collins provides a separate GeneralUser GS License v2.0; that bank is not covered by PlumSpirit's MIT license. Its license text and the third-party notices remain in the package, including the author's sample-provenance caveat.
+
+PlumSpirit's original-source MIT copyright statement uses 'PlumSpirit contributors' and needs publisher approval of the intended copyright holder and any third-party/branding rights before public upload.
+
+This package was statically checked only, not run on a real Windows machine. See docs/RELEASE_VALIDATION.md.
