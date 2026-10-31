@@ -1,0 +1,12 @@
+# CC Batch: an example plugin that ships with PlumSpirit (B1-0049).
+# Install it from Plugins > Lua Plugins > Examples, allow what it asks for and
+# enable it; the commands are then under Plugins > CC Batch (Example).
+id = "plumspirit.example.cc-batch"
+name = "CC Batch (Example)"
+version = "1.0.0"
+api = "0.1"
+entry = "main.lua"
+description = "Batch controller editing: writes a CC curve or LFO across the selected notes' time span (or the ruler's time selection) in one Undo step, and clears a controller there. The events are saved in the project and exported to MIDI."
+author = "PlumSpirit"
+license = "Same terms as PlumSpirit"
+capabilities = ["project.read", "notes.edit"]

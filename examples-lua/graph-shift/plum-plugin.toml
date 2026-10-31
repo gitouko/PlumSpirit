@@ -1,0 +1,12 @@
+# Graph Shift: an example plugin that ships with PlumSpirit (B1-0049).
+# Install it from Plugins > Lua Plugins > Examples, allow what it asks for and
+# enable it; the tool is then under Tools > Custom > Graph Shift.
+id = "plumspirit.example.graph-shift"
+name = "Graph Shift (Example)"
+version = "1.0.0"
+api = "0.1"
+entry = "main.lua"
+description = "A custom note tool: shifts each selected note up or down by a graph drawn over the selection's time span. Deterministic: the same notes and settings always give the same result."
+author = "PlumSpirit"
+license = "Same terms as PlumSpirit"
+capabilities = ["project.read", "notes.edit"]

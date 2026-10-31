@@ -1,0 +1,16 @@
+PlumSpirit v1.0.0 Windows x64 portable — user-supplied executable
+EXE original archive: PlumSpirit-v1.0-Launch-Windows-x64.zip
+EXE size: 37057024
+EXE SHA-256: 1ef1365d92bb60b654581f08f95ca61e31e889709330f3760a0a3f327bceab70
+Static PE format: PE32+ x86-64 GUI executable
+ZIP integrity: passed
+Build source Git commit: NOT VERIFIED BY THIS PREPARER
+Windows runtime test: NOT PERFORMED BY THIS PREPARER
+Signature: NOT VERIFIED
+Bundled default GeneralUser GS SoundFont: INCLUDED
+
+SoundFont SHA-256: 9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe
+SF2: GeneralUser GS v2.0.3; licensed separately from PlumSpirit MIT
+Source commit recorded in delivery manifest: 62dfc7e3936701fd9aa2bfc633938d05f861cbc8
+EXE built-from commit recorded in delivery manifest: b2c5093e56bf0284b4e4b3b5796bd9897394d70a
+Build/source provenance requires reconciliation.
