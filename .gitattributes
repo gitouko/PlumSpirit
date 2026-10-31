@@ -1,2 +1,13 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep LF line endings in the repository and in working copies on every OS,
+# so Windows and Linux checkouts produce identical diffs.
+* text=auto eol=lf
+
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.rgba  binary
+*.sf2   binary
+*.mid   binary
+*.midi  binary
+*.lup   binary
+*.bat   text eol=crlf

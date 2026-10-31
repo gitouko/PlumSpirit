@@ -1,0 +1,63 @@
+// Generates the 256-Key Mode (`.lup` version 6) migration fixture of V09-S06
+// with PlumSpirit v0.9 as it was before clips existed (commit aff02e9): built
+// here, saved by that writer, hashed by that build. v0.9 with clips opens it
+// as one identity clip per track with every hash equal and rewrites it byte
+// for byte (`tests/v09_clip_migration.rs`).
+//
+// Run inside an aff02e9 checkout (copied into crates/plumspirit_engine/src/,
+// declared `#[cfg(test)] mod v09_keys_fixture_gen;` in lib.rs):
+//   V08_FIXTURE_OUT=/path/to/tests/fixtures/v08 \
+//     cargo test --release -p plumspirit_engine --lib v09_keys_fixture_gen -- --ignored --nocapture
+
+use crate::model::project::{Bpm, KeyRange};
+use crate::model::track::{TrackKind, TrackProps};
+use crate::model::{NoteAttrs, NoteOffKind, NoteRecord, NoteStore, PlumDocument, SubchannelId};
+use crate::native::project_to_bytes;
+
+include!("../tests/fixtures/v08/semantic_hashes.rs");
+
+#[test]
+#[ignore]
+fn make_v09_keys_fixture() {
+    let out = std::path::PathBuf::from(std::env::var("V08_FIXTURE_OUT").expect("V08_FIXTURE_OUT"));
+    let mut d = PlumDocument::new_project("256 keys (v0.9 before clips)".into(), Bpm::DEFAULT, 960);
+    d.project_mut().keys = KeyRange::Extended256;
+    d.add_track().unwrap();
+    for ti in 0..2usize {
+        let notes: Vec<NoteRecord> = (0..2048u64)
+            .map(|k| NoteRecord {
+                start_tick: k * 30,
+                duration_ticks: 25 + (k % 7) * 10,
+                attrs: NoteAttrs::new_wide(
+                    ((k * 37 + ti as u64 * 11) % 256) as u8,
+                    1 + (k % 127) as u8,
+                    (k % 16) as u8,
+                    (k % 128) as u8,
+                    NoteOffKind::NoteOff,
+                )
+                .unwrap()
+                .with_muted(k % 31 == 0),
+                sub: SubchannelId(0),
+                group: 0,
+            })
+            .collect();
+        let t = d.track_mut(ti).unwrap();
+        t.notes = NoteStore::from_sorted_records(&notes, false).unwrap();
+    }
+    let t = d.track_mut(1).unwrap();
+    let end = t.end_of_track_tick;
+    let props = TrackProps {
+        kind: TrackKind::Melody,
+        key_correction: -200,
+        key_range: (3, 250),
+        ..t.props().clone()
+    };
+    t.set_props(props, end);
+    let bytes = project_to_bytes(&d).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 6);
+    let (back, _) = crate::native::project_from_bytes(&bytes).unwrap();
+    assert_eq!(hashes_text(&back), hashes_text(&d));
+    std::fs::write(out.join("keys256_v09.lup"), &bytes).unwrap();
+    std::fs::write(out.join("keys256_v09.hashes"), hashes_text(&d)).unwrap();
+    println!("keys256_v09: {} notes, {} bytes", d.note_count(), bytes.len());
+}

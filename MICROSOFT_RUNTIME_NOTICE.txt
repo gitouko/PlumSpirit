@@ -1,0 +1,15 @@
+Microsoft Visual C++ Runtime
+
+The Windows portable distribution includes the unmodified x64 vcruntime140.dll
+from Microsoft Visual Studio 18 Community's VC/Redist/MSVC/14.51.36231 directory
+(file version 14.51.36247.0). Copyright Microsoft Corporation.
+This Microsoft binary is supplied under Microsoft's applicable distribution terms,
+not under any PlumSpirit source license. The source snapshot does not contain it.
+
+Microsoft's instructions for application-local runtime deployment:
+https://learn.microsoft.com/en-us/cpp/windows/walkthrough-deploying-a-visual-cpp-application-to-an-application-local-folder
+The installed Visual Studio Redist.txt points to its distributable code list:
+https://aka.ms/vs/18/redistribution
+
+Windows 10/11 supplies the Universal CRT and other Windows system DLLs. Keep
+vcruntime140.dll beside PlumSpirit.exe when sharing the portable folder.

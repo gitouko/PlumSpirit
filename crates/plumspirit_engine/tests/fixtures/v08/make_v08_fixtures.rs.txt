@@ -1,0 +1,411 @@
+// Generates the v0.8 migration fixtures of V09-S06 (contract §040 / §241) with
+// PlumSpirit v0.8 itself (release commit 058a094): each fixture is built here,
+// saved by v0.8's `.lup` writer, and its semantic hashes are computed by v0.8.
+// v0.9 opens the files and must find one identity clip per track with every
+// hash equal (`tests/v09_clip_migration.rs`).
+//
+// Run inside a v0.8 checkout (this file is copied into
+// crates/plumspirit_engine/src/ and declared `#[cfg(test)] mod v08_fixture_gen;`
+// in lib.rs):
+//   V08_FIXTURE_OUT=/path/to/tests/fixtures/v08 \
+//     cargo test --release -p plumspirit_engine --lib v08_fixture_gen -- --ignored --nocapture
+
+use crate::midi::import_bytes;
+use crate::model::conductor::{Interp, MasterVolumePoint};
+use crate::model::project::Bpm;
+use crate::model::track::{Subchannel, SubchannelTable, TrackKind, TrackProps};
+use crate::model::{
+    FolderInfo, GroupInfo, NoteAttrs, NoteOffKind, NoteRecord, NoteStore, PlumDocument,
+    SubchannelId, TrackFolders, TrackId,
+};
+use crate::native::project_to_bytes;
+
+include!("../tests/fixtures/v08/semantic_hashes.rs");
+
+/// A Standard MIDI File track: (delta-free) events at absolute ticks.
+#[derive(Default)]
+struct Mtrk {
+    events: Vec<(u64, u32, Vec<u8>)>,
+}
+
+impl Mtrk {
+    fn ev(&mut self, tick: u64, bytes: &[u8]) -> &mut Self {
+        let n = self.events.len() as u32;
+        self.events.push((tick, n, bytes.to_vec()));
+        self
+    }
+    fn meta(&mut self, tick: u64, ty: u8, data: &[u8]) -> &mut Self {
+        let mut b = vec![0xFF, ty];
+        vlq(&mut b, data.len() as u64);
+        b.extend_from_slice(data);
+        self.ev(tick, &b)
+    }
+    fn note(&mut self, tick: u64, len: u64, ch: u8, key: u8, vel: u8) -> &mut Self {
+        self.ev(tick, &[0x90 | ch, key, vel]);
+        self.ev(tick + len, &[0x80 | ch, key, 64])
+    }
+    fn bytes(&self) -> Vec<u8> {
+        let mut ev = self.events.clone();
+        // Stable by tick; at equal ticks Note Offs first (as a sequencer writes).
+        ev.sort_by_key(|(t, n, b)| (*t, u8::from(b[0] & 0xF0 != 0x80), *n));
+        let mut out = Vec::new();
+        let mut last = 0;
+        for (t, _, b) in ev {
+            vlq(&mut out, t - last);
+            out.extend_from_slice(&b);
+            last = t;
+        }
+        out.extend_from_slice(&[0, 0xFF, 0x2F, 0]);
+        let mut chunk = b"MTrk".to_vec();
+        chunk.extend_from_slice(&(out.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(&out);
+        chunk
+    }
+}
+
+fn vlq(out: &mut Vec<u8>, mut v: u64) {
+    let mut stack = vec![(v & 0x7F) as u8];
+    v >>= 7;
+    while v > 0 {
+        stack.push(0x80 | (v & 0x7F) as u8);
+        v >>= 7;
+    }
+    out.extend(stack.iter().rev());
+}
+
+fn smf(ppq: u16, tracks: &[Mtrk]) -> Vec<u8> {
+    let mut out = b"MThd".to_vec();
+    out.extend_from_slice(&6u32.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+    out.extend_from_slice(&ppq.to_be_bytes());
+    for t in tracks {
+        out.extend_from_slice(&t.bytes());
+    }
+    out
+}
+
+fn tempo_meta(t: &mut Mtrk, tick: u64, bpm: f64) {
+    let us = (60_000_000.0 / bpm).round() as u32;
+    t.meta(tick, 0x51, &us.to_be_bytes()[1..]);
+}
+
+/// Deterministic pseudo-random numbers (xorshift64).
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn import(bytes: &[u8]) -> PlumDocument {
+    import_bytes(bytes).expect("v0.8 imports the fixture MIDI").0
+}
+
+fn empty() -> PlumDocument {
+    PlumDocument::new_project("Empty v0.8 project".into(), Bpm::DEFAULT, 960)
+}
+
+/// Format 1, PPQN 480: a conductor track, a piano and a drum track.
+fn simple_midi() -> Vec<u8> {
+    let mut c = Mtrk::default();
+    c.meta(0, 0x03, b"Simple");
+    tempo_meta(&mut c, 0, 128.0);
+    c.meta(0, 0x58, &[4, 2, 24, 8]);
+    let mut p = Mtrk::default();
+    p.meta(0, 0x03, b"Piano").ev(0, &[0xC0, 0]).ev(0, &[0xB0, 7, 100]);
+    for i in 0..32u64 {
+        p.note(i * 240, 220, 0, 60 + (i % 12) as u8, 70 + (i % 50) as u8);
+    }
+    let mut d = Mtrk::default();
+    d.meta(0, 0x03, b"Drums");
+    for i in 0..16u64 {
+        d.note(i * 480, 60, 9, if i % 2 == 0 { 36 } else { 38 }, 110);
+    }
+    smf(480, &[c, p, d])
+}
+
+/// 24 tracks of dense notes arranged as a track / subtrack tree (depth 3),
+/// with properties, Mute / Solo, colours, corrections and two folders.
+fn large_tree() -> PlumDocument {
+    let mut rng = Rng(0x5EED_0008);
+    let mut tracks = Vec::new();
+    let mut c = Mtrk::default();
+    c.meta(0, 0x03, b"Large tree");
+    tempo_meta(&mut c, 0, 175.0);
+    tracks.push(c);
+    for i in 1..24u64 {
+        let mut t = Mtrk::default();
+        t.meta(0, 0x03, format!("Layer {i}").as_bytes());
+        let ch = (i % 16) as u8;
+        for k in 0..4200u64 {
+            let key = 21 + rng.below(88) as u8;
+            t.note(k * 24 + rng.below(12), 10 + rng.below(200), ch, key, 1 + rng.below(127) as u8);
+        }
+        tracks.push(t);
+    }
+    let mut d = import(&smf(960, &tracks));
+    let ids: Vec<TrackId> = d.tracks().iter().map(|t| t.id()).collect();
+    // i % 4 == 1: top level; 2: child of the top; 3: child of 2; 0: child of
+    // the top (depth first, every subtree contiguous).
+    let mut top = ids[0];
+    for i in 1..ids.len() {
+        let parent = match i % 4 {
+            1 => {
+                top = ids[i];
+                None
+            }
+            3 => Some(ids[i - 1]),
+            _ => Some(top),
+        };
+        d.track_mut(i).unwrap().set_parent(parent);
+    }
+    d.validate_hierarchy().expect("a valid tree");
+    for i in [2usize, 5, 11, 17] {
+        let t = d.track_mut(i).unwrap();
+        let end = t.end_of_track_tick;
+        let props = TrackProps {
+            kind: if i == 5 { TrackKind::Rhythm } else { TrackKind::Melody },
+            tick_correction: 12 * i as i64,
+            correction_from_measure: 2,
+            key_correction: -(i as i8),
+            key_range: (24, 108),
+            onion_color: Some([i as u8 * 10, 200, 40]),
+            ..t.props().clone()
+        };
+        t.set_props(props, end);
+    }
+    d.track_mut(9).unwrap().mute = true;
+    d.track_mut(13).unwrap().solo = true;
+    let folders = TrackFolders::from_parts(
+        vec![
+            FolderInfo {
+                id: 1,
+                name: "Strings".into(),
+                anchor: Some(ids[1]),
+            },
+            FolderInfo {
+                id: 2,
+                name: "Leads".into(),
+                anchor: None,
+            },
+        ],
+        vec![(ids[1], 1), (ids[5], 1), (ids[13], 2)],
+        3,
+    )
+    .expect("folders");
+    d.project_mut().folders = folders;
+    d.project_mut().folders_collapsed.insert(2);
+    d.project_mut().name = "Large track / subtrack project".into();
+    d
+}
+
+/// Three tracks with six subchannels each (names, MIDI channels that differ
+/// from the subchannel), notes spread over them on independent channels,
+/// note groups (nested, locked, named, coloured, linked) and muted notes.
+fn multi_subchannel() -> PlumDocument {
+    let mut d = PlumDocument::new_project("Multi-subchannel".into(), Bpm::DEFAULT, 960);
+    d.add_track().unwrap();
+    d.add_track().unwrap();
+    let g = &mut d.project_mut().groups;
+    let a = g.add(GroupInfo {
+        name: Some("Chords".into()),
+        color: Some([200, 40, 90]),
+        ..GroupInfo::default()
+    });
+    let b = g.add(GroupInfo {
+        parent: a,
+        locked: true,
+        link: 7,
+        ..GroupInfo::default()
+    });
+    let c = g.add(GroupInfo {
+        name: Some("Arp".into()),
+        link: 7,
+        ..GroupInfo::default()
+    });
+    let mut rng = Rng(0x5EED_0005);
+    for ti in 0..3usize {
+        let subs = SubchannelTable::from_entries(
+            (0..6u32)
+                .map(|s| Subchannel {
+                    id: SubchannelId(s),
+                    midi_channel: ((s * 3 + ti as u32) % 16) as u8,
+                    name: (s % 2 == 1).then(|| format!("Sub {s} · track {ti}")),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut notes: Vec<NoteRecord> = (0..3000u64)
+            .map(|k| {
+                let sub = rng.below(6) as u32;
+                let ch = rng.below(16) as u8;
+                let attrs = NoteAttrs::new(
+                    rng.below(128) as u8,
+                    1 + rng.below(127) as u8,
+                    ch,
+                    rng.below(128) as u8,
+                    if k % 7 == 0 { NoteOffKind::NoteOnZero } else { NoteOffKind::NoteOff },
+                )
+                .unwrap()
+                .with_muted(k % 13 == 0);
+                NoteRecord {
+                    start_tick: k * 40,
+                    duration_ticks: 1 + rng.below(400),
+                    attrs,
+                    sub: SubchannelId(sub),
+                    group: [0, 0, a, b, c][(k % 5) as usize],
+                }
+            })
+            .collect();
+        notes.sort_by_key(|n| n.start_tick);
+        let t = d.track_mut(ti).unwrap();
+        t.notes = NoteStore::from_sorted_records(&notes, false).unwrap();
+        t.set_subchannels(subs);
+    }
+    d
+}
+
+/// Four tracks with dense controller sweeps (volume, pan, modulation,
+/// expression), pitch bend, channel pressure, program changes, SysEx and text.
+fn cc_heavy() -> Vec<u8> {
+    let mut c = Mtrk::default();
+    c.meta(0, 0x03, b"CC heavy");
+    tempo_meta(&mut c, 0, 140.0);
+    let mut tracks = vec![c];
+    for ti in 0..4u8 {
+        let mut t = Mtrk::default();
+        t.meta(0, 0x03, format!("Sweeps {ti}").as_bytes())
+            .ev(0, &[0xC0 | ti, 48 + ti])
+            .ev(0, &[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7])
+            .meta(0, 0x01, format!("CC lane {ti}").as_bytes());
+        for k in 0..12_000u64 {
+            let tick = k * 4;
+            let v = ((k * 7 + u64::from(ti) * 13) % 128) as u8;
+            let cc = [7u8, 10, 1, 11][(k % 4) as usize];
+            t.ev(tick, &[0xB0 | ti, cc, v]);
+            if k % 3 == 0 {
+                let bend = ((k * 97) % 16384) as u16;
+                t.ev(tick, &[0xE0 | ti, (bend & 0x7F) as u8, (bend >> 7) as u8]);
+            }
+            if k % 50 == 0 {
+                t.ev(tick, &[0xD0 | ti, v]);
+            }
+        }
+        for k in 0..500u64 {
+            t.note(k * 96, 90, ti, 40 + (k % 40) as u8, 100);
+        }
+        tracks.push(t);
+    }
+    smf(960, &tracks)
+}
+
+/// Tempo automation: a tempo change every beat (some ramps), signature
+/// changes, markers, cue points and chapters, Master Volume points.
+fn tempo_automation() -> PlumDocument {
+    let mut c = Mtrk::default();
+    c.meta(0, 0x03, b"Tempo automation");
+    for k in 0..600u64 {
+        tempo_meta(&mut c, k * 960, 90.0 + (k % 120) as f64 * 1.5);
+    }
+    for (k, (n, dp)) in [(4u8, 2u8), (7, 3), (3, 2), (5, 2), (6, 3)].iter().enumerate() {
+        c.meta(k as u64 * 96_000, 0x58, &[*n, *dp, 24, 8]);
+    }
+    for k in 0..40u64 {
+        c.meta(k * 14_400, 0x06, format!("Section {k}").as_bytes());
+        if k % 5 == 0 {
+            c.meta(k * 14_400 + 480, 0x07, format!("Cue {k}").as_bytes());
+        }
+    }
+    let mut p = Mtrk::default();
+    p.meta(0, 0x03, b"Pulse");
+    for k in 0..2400u64 {
+        p.note(k * 240, 200, 0, 60 + (k % 24) as u8, 90);
+    }
+    let mut d = import(&smf(960, &[c, p]));
+    // Ramps on every third point, chapters on every fourth marker, Master
+    // Volume automation — what MIDI files cannot carry, kept by `.lup`.
+    let cond = d.conductor().clone();
+    let mut tempo = cond.tempo_points().to_vec();
+    for (k, p) in tempo.iter_mut().enumerate() {
+        if k % 3 == 1 && k + 1 < 600 {
+            p.interp = Interp::Linear;
+        }
+    }
+    let mut markers = cond.markers().to_vec();
+    for (k, m) in markers.iter_mut().enumerate() {
+        if k % 4 == 0 && !m.cue {
+            m.end = Some(m.start + 9_600);
+        }
+    }
+    let mut next = cond.next_id();
+    let master: Vec<MasterVolumePoint> = (0..24u64)
+        .map(|k| {
+            next += 1;
+            MasterVolumePoint {
+                id: next - 1,
+                tick: k * 24_000,
+                value: (4_000 + k * 500) as u16,
+                device: 0x7F,
+                origin: None,
+            }
+        })
+        .collect();
+    let rebuilt = crate::model::conductor::Conductor::from_parts_with_master(
+        cond.scope(),
+        tempo,
+        cond.time_signatures().to_vec(),
+        markers,
+        master,
+        next,
+    )
+    .expect("a valid conductor");
+    *d.conductor_mut() = rebuilt;
+    d.project_mut().name = "Tempo automation".into();
+    d
+}
+
+#[test]
+#[ignore]
+fn make_v08_fixtures() {
+    let out = std::path::PathBuf::from(std::env::var("V08_FIXTURE_OUT").expect("V08_FIXTURE_OUT"));
+    std::fs::create_dir_all(&out).unwrap();
+    let simple = simple_midi();
+    std::fs::write(out.join("simple_midi_v08.mid"), &simple).unwrap();
+    let cc = cc_heavy();
+    let docs: Vec<(&str, PlumDocument)> = vec![
+        ("empty_v08", empty()),
+        ("simple_midi_v08", import(&simple)),
+        ("large_tree_v08", large_tree()),
+        ("multi_subchannel_v08", multi_subchannel()),
+        ("cc_heavy_v08", import(&cc)),
+        ("tempo_automation_v08", tempo_automation()),
+    ];
+    for (name, d) in &docs {
+        let bytes = project_to_bytes(d).expect("v0.8 writes the fixture");
+        // v0.8 reads its own file back to the same hashes.
+        let (back, _) = crate::native::project_from_bytes(&bytes).unwrap();
+        assert_eq!(hashes_text(&back), hashes_text(d), "{name}");
+        std::fs::write(out.join(format!("{name}.lup")), &bytes).unwrap();
+        std::fs::write(out.join(format!("{name}.hashes")), hashes_text(d)).unwrap();
+        println!(
+            "{name}: {} tracks, {} notes, {} events, {} bytes",
+            d.track_count(),
+            d.note_count(),
+            d.tracks().iter().map(|t| t.events.len()).sum::<usize>(),
+            bytes.len()
+        );
+    }
+    // The simple MIDI as v0.8 imports it (v0.9 must import the .mid the same).
+    std::fs::write(
+        out.join("simple_midi_v08.mid.hashes"),
+        hashes_text(&import(&simple)),
+    )
+    .unwrap();
+}

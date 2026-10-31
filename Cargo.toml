@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/plumspirit_engine", "crates/plumspirit"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[profile.release]
+opt-level = 3
+# Thin LTO gives most of the cross-crate inlining benefit (the engine is a separate
+# crate) without the multi-minute link times of fat LTO.
+lto = "thin"
+codegen-units = 4
+# Symbols are stripped from the distributable; diagnostics come from PlumSpirit's own
+# log file, not from debugger symbols.
+strip = "symbols"
+panic = "unwind"
+
+[profile.dev.package."*"]
+# Dependencies are compiled with optimizations even in debug builds so that the
+# GUI stays usable when developing against large fixtures.
+opt-level = 2
+
+[profile.bench]
+debug = false

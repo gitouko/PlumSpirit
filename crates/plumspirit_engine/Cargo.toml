@@ -1,0 +1,13 @@
+[package]
+name = "plumspirit_engine"
+description = "PlumSpirit's MIDI document engine: compact note storage, Standard MIDI File import/export, editing and transforms. Has no GUI dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Intentionally dependency-free: the engine only uses the Rust standard library.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

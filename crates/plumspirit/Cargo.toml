@@ -1,0 +1,88 @@
+[package]
+name = "plumspirit"
+description = "PlumSpirit: an original Black MIDI editor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "PlumSpirit"
+path = "src/main.rs"
+
+[dependencies]
+plumspirit_engine = { path = "../plumspirit_engine" }
+# GUI: egui immediate-mode UI. Two renderers (v0.8, View → Renderer): glow
+# (OpenGL, the default — small, runs on ordinary integrated graphics) and wgpu
+# restricted to its Vulkan backend (no DX12 / Metal / GL inside wgpu, to keep
+# the binary small); MIT OR Apache-2.0.
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "x11", "wayland"] }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "vulkan"] }
+egui = { version = "0.36.2", default-features = false }
+log = "0.4"
+serde_json = "1"
+# SoundFont (SF2) synthesis, pure Rust (MIT).
+rustysynth = "1.3.6"
+# Audio output: WASAPI on Windows, ALSA on Linux (Apache-2.0).
+cpal = "0.18.2"
+# Picture decoding for the Image to MIDI plugin (MIT OR Apache-2.0; codecs
+# png, zune-jpeg, image-webp, gif: MIT / Apache-2.0 / Zlib; tiff + fax: MIT, V09-S47).
+# Audio Reference decoders (WAV is PlumSpirit's own): FLAC (Apache-2.0), Ogg
+# Vorbis (MIT OR Apache-2.0; ogg: BSD-3-Clause), MP3 (nanomp3: a safe Rust
+# port of minimp3, MIT OR Apache-2.0; without its SIMD dependency).
+claxon = "0.4.3"
+lewton = "0.10.2"
+nanomp3 = { version = "0.2.0", default-features = false, features = ["std"] }
+# Glyph outlines for Spiderweb's Text tool (MIT OR Apache-2.0; already used by
+# egui's font stack).
+skrifa = "0.44"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] }
+# B1-0020: the Lua scripting host — mlua (MIT) with Lua 5.4 built from source
+# by lua-src (Lua: MIT; `vendored`: no system Lua, the same interpreter on every
+# PC). No async, no serde, no module loading (`module` off): scripts are
+# sandboxed (docs/LUA_API.md).
+mlua = { version = "0.12", default-features = false, features = ["lua54", "vendored"] }
+# v1.0-Launch L-D01: compressed MIDI downloads (archive/). Decoders only, pure
+# Rust: gzip / zip deflate (flate2 on miniz_oxide, MIT OR Apache-2.0), xz
+# (lzma-rust2, Apache-2.0; sha2 MIT OR Apache-2.0), zstd (ruzstd, MIT; twox-hash
+# MIT). Zip and tar are read by PlumSpirit's own bounded readers.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
+ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
+crc32fast = "1.5"
+# L-D01 (L-S10): 7z archives — sevenz-rust2 (Apache-2.0) without default
+# features: LZMA / LZMA2 / BCJ / delta / copy only (no AES, no C codecs). It
+# decodes through the same lzma-rust2 as the xz reader.
+sevenz-rust2 = { version = "0.24", default-features = false }
+
+# Native file dialogs (Windows common item dialog / macOS NSSavePanel).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+# Font registry lookup, process memory and CPU time, MIDI output (winmm), screen
+# work area and the startup error box (see platform.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# L-S45 (E0075: releasing a 224M-note project stalled the window 130 ms on
+# Windows' process heap): mimalloc (MIT) is the global allocator on Windows.
+mimalloc = { version = "0.1.52", default-features = false }
+
+[build-dependencies]
+embed-resource = "3"
+
+# Tests only: xz and 7z encoding to build archive fixtures in memory (L-D01).
+[dev-dependencies]
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress"] }

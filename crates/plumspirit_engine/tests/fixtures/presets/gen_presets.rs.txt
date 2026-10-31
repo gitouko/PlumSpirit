@@ -1,0 +1,96 @@
+//! Writes tool presets with this engine's own preset writer (V09-S33 step 4
+//! fixtures): for every registered tool, (1) the defaults with every advanced
+//! function switched on and (2) seeded random settings within each
+//! parameter's range, every function on. Output: chunks headed
+//! `%%% <tool id> <variant>` followed by the preset text.
+
+use plumspirit_engine::transform::param::{Curve, ParamKind, ParamSet, ParamValue};
+use plumspirit_engine::transform::preset::{Preset, to_text};
+use plumspirit_engine::transform::registry;
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        // splitmix64
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next() % n }
+    }
+    fn int(&mut self, lo: i64, hi: i64) -> i64 {
+        let span = (hi as i128 - lo as i128 + 1).clamp(1, 1 << 40) as u64;
+        (lo as i128 + self.below(span) as i128).min(hi as i128) as i64
+    }
+    fn unit(&mut self) -> f64 {
+        (self.below(1001) as f64) / 1000.0
+    }
+}
+
+fn is_switch(key: &str) -> bool {
+    key.len() >= 2 && key.starts_with('a') && key[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+fn main() {
+    let label = std::env::args().nth(1).expect("version label");
+    let mut rng = Rng(0x5033_3354_4550_3400 ^ label.len() as u64);
+    let mut out = String::new();
+    for t in registry() {
+        let spec = (t.spec)();
+        let mut all_on = ParamSet::defaults(&spec.params);
+        for p in &spec.params {
+            if is_switch(p.key) {
+                all_on.set(p.key, ParamValue::Bool(true));
+            }
+        }
+        let mut random = ParamSet::defaults(&spec.params);
+        for p in &spec.params {
+            let v = match &p.kind {
+                _ if is_switch(p.key) => ParamValue::Bool(true),
+                ParamKind::Int { min, max } => ParamValue::Int(rng.int(*min, *max)),
+                ParamKind::Float { min, max, .. } => {
+                    let v = min + rng.unit() * (max - min);
+                    ParamValue::Float(((v * 100.0).round() / 100.0).clamp(*min, *max))
+                }
+                ParamKind::Bool => ParamValue::Bool(rng.below(2) == 1),
+                ParamKind::Choice(o) => ParamValue::Choice(rng.below(o.len() as u64) as u32),
+                ParamKind::Ticks { min, max } => {
+                    let hi = (*max).min(min.saturating_add(100_000));
+                    ParamValue::Int(rng.int(*min as i64, hi as i64))
+                }
+                ParamKind::Pitch => ParamValue::Int(rng.int(0, 127)),
+                ParamKind::Curve => {
+                    let n = 2 + rng.below(4) as usize;
+                    let mut pts = vec![(0.0, rng.unit())];
+                    for _ in 2..n {
+                        pts.push((rng.unit(), rng.unit()));
+                    }
+                    pts.push((1.0, rng.unit()));
+                    let c = Curve { points: pts, smooth: rng.below(2) == 1 };
+                    ParamValue::Curve(c.sanitized())
+                }
+                ParamKind::List { min, max, max_len } => {
+                    let len = 1 + rng.below((*max_len).min(8) as u64) as usize;
+                    ParamValue::List((0..len).map(|_| rng.int(*min, *max)).collect())
+                }
+                ParamKind::Seed => ParamValue::Int(rng.int(0, 999_999)),
+                // Free text is parsed by the tool (chords, names): keep it.
+                _ => p.default.clone(),
+            };
+            random.set(p.key, v);
+        }
+        for (variant, set) in [("all-on", all_on), ("random", random)] {
+            let text = to_text(&Preset {
+                tool: t.id.to_string(),
+                name: format!("PlumSpirit {label} {} {variant}", t.id),
+                values: set,
+            });
+            out.push_str(&format!("%%% {} {variant}\n", t.id));
+            out.push_str(&text);
+        }
+    }
+    print!("{out}");
+}

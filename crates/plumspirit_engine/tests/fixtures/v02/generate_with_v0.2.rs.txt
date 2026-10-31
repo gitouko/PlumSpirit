@@ -1,0 +1,108 @@
+//! Writes v0.2 (.lup format version 1) fixtures for the v0.3 migration tests.
+//! Run in a v0.2 checkout:
+//! PLUM_FIXTURE_DIR=<dir> cargo test -p plumspirit_engine --test make_v03_fixtures -- --ignored
+
+mod common;
+
+use common::*;
+use plumspirit_engine::history::{History, Operation};
+use plumspirit_engine::midi::{export_to_bytes, import_bytes};
+use plumspirit_engine::model::{Bpm, OnionConfig, OnionMode, PlumDocument, SoundFontRef, TrackId};
+use plumspirit_engine::native::project_to_bytes;
+
+fn save(dir: &std::path::Path, name: &str, doc: &PlumDocument) {
+    std::fs::write(dir.join(format!("{name}.lup")), project_to_bytes(doc).unwrap()).unwrap();
+    std::fs::write(dir.join(format!("{name}.mid")), export_to_bytes(doc).unwrap()).unwrap();
+}
+
+fn imported() -> PlumDocument {
+    let tr0 = {
+        let mut t = TrackBytes::new();
+        t.meta(0, 0x03, b"Conductor \xE9")
+            .meta(0, 0x51, &[0x07, 0xA1, 0x20]) // 500,000 (shadowed)
+            .meta(0, 0x51, &[0x06, 0x1A, 0x80]) // 400,000 (plays)
+            .meta(0, 0x58, &[3, 2, 24, 8])
+            .meta(0, 0x06, b"Intro")
+            .meta(1920, 0x51, &[0x03, 0xD0, 0x90]) // 250,000
+            .meta(2880, 0x58, &[7, 3, 24, 8])
+            .meta(3000, 0x07, b"Hit");
+        t.eot(9000)
+    };
+    let tr1 = {
+        let mut t = TrackBytes::new();
+        t.ev(0, &[0xB0, 0x0A, 0x20]) // pan
+            .ev(0, &[0xC0, 0x05])
+            .on(0, 0, 60, 100)
+            .ev(10, &[0xE0, 0x00, 0x50]) // pitch bend
+            .off(480, 0, 60, 64)
+            .on(480, 9, 36, 127)
+            .meta(960, 0x51, &[0x09, 0x27, 0xC0]) // 600,000 in another track
+            .off(960, 9, 36, 0)
+            .meta(1440, 0x06, b"Drop")
+            .on(1440, 1, 72, 1)
+            .off(2000, 1, 72, 0);
+        t.eot(2400)
+    };
+    let (mut doc, _) = import_bytes(&smf(1, 480, &[tr0, tr1])).unwrap();
+    let p = doc.project_mut();
+    p.name = "Imported ✓".into();
+    p.onion = OnionConfig {
+        mode: OnionMode::Specific,
+        specific: vec![TrackId(1)],
+        opacity: 35,
+    };
+    doc
+}
+
+#[test]
+#[ignore = "writes fixtures"]
+fn write_fixtures() {
+    let dir = std::path::PathBuf::from(std::env::var("PLUM_FIXTURE_DIR").unwrap());
+    // A new project: exact decimal project tempo, raw 4/4 time signature.
+    let mut doc = PlumDocument::new_project("Legacy ✓".into(), Bpm::parse("150.5").unwrap(), 960);
+    doc.track_mut(0)
+        .unwrap()
+        .notes
+        .insert_sorted_batch(&[rec(0, 960, 60), rec(960, 480, 64), rec(1920, 1, 67)], false)
+        .unwrap();
+    let t = doc.add_track().unwrap();
+    doc.track_mut(t)
+        .unwrap()
+        .notes
+        .insert_sorted_batch(&[rec(0, 240, 36), rec(480, 240, 38)], false)
+        .unwrap();
+    doc.project_mut().soundfont = Some(SoundFontRef {
+        path: "C:\\SoundFonts\\GeneralUser GS.sf2".into(),
+    });
+    save(&dir, "new_project", &doc);
+    // An imported file with tempo/meter/markers in two tracks.
+    save(&dir, "imported", &imported());
+    // …plus a project tempo (v0.2 replaced the tick-0 tempo events on export).
+    let mut doc = imported();
+    History::default()
+        .apply(&mut doc, Operation::SetTempo(Some(Bpm::parse("123.456").unwrap())))
+        .unwrap();
+    save(&dir, "imported_project_tempo", &doc);
+    // Many tracks (with deleted track ids in between), notes on every channel.
+    let mut doc = PlumDocument::new_project("Many".into(), Bpm::parse("200").unwrap(), 96);
+    for i in 0..70u64 {
+        let t = doc.add_track().unwrap();
+        let recs: Vec<_> = (0..8u64)
+            .map(|k| {
+                let mut r = rec(k * 96 + i, 90, (24 + i + k) as u8);
+                r.attrs = attrs((24 + i + k) as u8, (1 + i * 3 % 127) as u8, (i % 16) as u8);
+                r
+            })
+            .collect();
+        doc.track_mut(t).unwrap().notes.insert_sorted_batch(&recs, false).unwrap();
+    }
+    for index in [65usize, 40, 3] {
+        doc.delete_track(index).unwrap();
+    }
+    doc.project_mut().onion = OnionConfig {
+        mode: OnionMode::AllOthers,
+        specific: Vec::new(),
+        opacity: 60,
+    };
+    save(&dir, "many_tracks", &doc);
+}

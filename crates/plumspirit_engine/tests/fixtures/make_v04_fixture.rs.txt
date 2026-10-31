@@ -1,0 +1,72 @@
+//! Writes `journey_v04.lup` with the PlumSpirit v0.4 engine (commit 298664d):
+//! a multichannel track, a single-channel track with properties, an empty track,
+//! a tempo ramp, a marker, Onion Skin settings and Mute.
+use plumspirit_engine::history::{History, Operation};
+use plumspirit_engine::model::conductor::Interp;
+use plumspirit_engine::model::project::{OnionConfig, OnionMode};
+use plumspirit_engine::model::{
+    Bpm, GatePercent, NoteAttrs, NoteOffKind, NoteRecord, PlumDocument, TempoValue, TrackKind,
+};
+use plumspirit_engine::native::project_to_bytes;
+
+fn n(start: u64, pitch: u8, vel: u8, ch: u8) -> NoteRecord {
+    NoteRecord {
+        start_tick: start,
+        duration_ticks: 240,
+        attrs: NoteAttrs::new(pitch, vel, ch, 0, NoteOffKind::NoteOff).unwrap(),
+    }
+}
+
+fn main() {
+    let path = std::env::args().nth(1).expect("output path");
+    let mut d = PlumDocument::new_project("Journey v04".into(), Bpm::parse("150").unwrap(), 960);
+    let mut h = History::default();
+    h.apply(&mut d, Operation::AddTrack).unwrap();
+    h.apply(&mut d, Operation::AddTrack).unwrap();
+    // Track 1: channels 1, 5 and 10.
+    let mut a: Vec<NoteRecord> = (0..24u64)
+        .map(|i| n(i * 480, 48 + (i % 12) as u8, 20 + (i * 4) as u8, [0u8, 4, 9][(i % 3) as usize]))
+        .collect();
+    a.sort_by_key(|r| r.start_tick);
+    d.track_mut(0).unwrap().notes.insert_sorted_batch(&a, false).unwrap();
+    // Track 2: channel 3 only, with properties (new notes on channel 3, +12 keys).
+    let b: Vec<NoteRecord> = (0..8u64).map(|i| n(i * 960, 60 + i as u8, 100, 2)).collect();
+    d.track_mut(1).unwrap().notes.insert_sorted_batch(&b, false).unwrap();
+    let id1 = d.track(1).unwrap().id();
+    let mut props = d.track(1).unwrap().props().clone();
+    props.default_channel = 2;
+    props.kind = TrackKind::Melody;
+    props.key_correction = 12;
+    props.gate = GatePercent::from_hundredths(5_000).unwrap();
+    h.apply(
+        &mut d,
+        Operation::TrackProps { track: id1, props, end: None, label: "Track Properties" },
+    )
+    .unwrap();
+    // Conductor: a ramp 150 → 180 over bars 3–5, and a marker.
+    let c = d.conductor();
+    let e = c
+        .prepare_set_tempo(None, 3840 * 2, TempoValue::Bpm(Bpm::parse("150").unwrap()), Interp::Linear)
+        .unwrap();
+    h.apply(&mut d, Operation::Conductor { edit: e, label: "Tempo" }).unwrap();
+    let e = d
+        .conductor()
+        .prepare_set_tempo(None, 3840 * 4, TempoValue::Bpm(Bpm::parse("180").unwrap()), Interp::Step)
+        .unwrap();
+    h.apply(&mut d, Operation::Conductor { edit: e, label: "Tempo" }).unwrap();
+    // Onion Skin: specific track 2, 50 %; track 3 muted.
+    {
+        let id = d.track(1).unwrap().id();
+        let p = d.project_mut();
+        p.onion = OnionConfig { mode: OnionMode::Specific, specific: vec![id], opacity: 50 };
+    }
+    d.track_mut(2).unwrap().mute = true;
+    let bytes = project_to_bytes(&d).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    println!("wrote {path}: {} bytes, {} notes", bytes.len(), d.note_count());
+    let plan = plumspirit_engine::midi::plan_export(&d);
+    let mid = plumspirit_engine::midi::export_to_bytes_with(&d, &plan).unwrap();
+    let mpath = path.replace(".lup", ".mid");
+    std::fs::write(&mpath, &mid).unwrap();
+    println!("wrote {mpath}: {} bytes", mid.len());
+}
