@@ -4,11 +4,11 @@
 
 **A free, portable MIDI sequencer made specifically for Black MIDI production.**
 
-## Before anything else — how PlumSpirit was made
+## Before anything else, how PlumSpirit was made
 
 I want to make this clear from the beginning instead of having people find out about it later. **PlumSpirit was vibe-coded.** AI was used to help write and develop the program, and I'm not going to hide that or pretend the entire codebase was handwritten by me.
 
-But at the same time, PlumSpirit wasn't something I just thought of one afternoon and asked an AI to finish in a single prompt. I spent **33 days — over a month** getting it to v1.0, putting dedicated hours into planning the features, making private lists of things I wanted changed, reviewing the development, trying the builds myself, looking through other Black MIDI software for ideas, and working through the problems I kept finding. **This isn't meant to be a flex.** I just want people to know where the project came from and how much I wanted to see it become a real program.
+But at the same time, PlumSpirit wasn't something I just thought of one afternoon and asked an AI to finish in a single prompt. I spent **33 days over a month** getting it to v1.0, putting dedicated hours into planning the features, making private lists of things I wanted changed, reviewing the development, trying the builds myself, looking through other Black MIDI software for ideas, and working through the problems I kept finding. **This isn't meant to be a flex.** I just want people to know where the project came from and how much I wanted to see it become a real program.
 
 I've tried to get as many bugs, glitches and conflicts fixed as possible, especially the ones that would make an editor frustrating to use in the first place. That doesn't mean I can guarantee everything is perfect. There can absolutely still be problems I haven't found yet, especially with the extremely large MIDIs people in this community make. That's one of the reasons I'm releasing it: so people can try it for themselves and tell me what I should improve next.
 
@@ -38,7 +38,7 @@ I know there are some Piano Roll tools that may look like they have a similar pu
 
 I don't want to claim that every other MIDI editor is missing every one of these ideas. What matters to me is having this particular combination of tools centered around Black MIDI production.
 
-## Download — no building required
+## Download  no building required
 
 Go to the **GitHub Releases (on the official PlumSpirit repository)** page and download the latest **Windows x64 Portable** ZIP. Extract the entire folder somewhere you can keep it, and run `PlumSpirit.exe`.
 
