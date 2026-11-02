@@ -85,6 +85,9 @@ Please don't upload private MIDIs or personal files publicly unless you're comfo
 
 **Planned platforms:** Windows x64 is the focus for this release. Linux and Android are planned for later months. macOS is currently pushed toward **late 2027**. Those are plans rather than guaranteed release dates.
 
+If you want to see more amazing creativites, or anything of plumspirit in general, Join our Server!
+**Discord Server:** https://discord.gg/CaYeRtvpQQ (24/7 link, never expires)
+
 ## Source code, forks and licensing
 
 PlumSpirit's **original source code is released under the [MIT License](LICENSE)**. You're welcome to fork it, change it, experiment with it and make your own version. MIT is permissive, but when redistributing the licensed code, **you must retain the applicable copyright and license notice**. That requirement is separate from the no-credit-needed rule for music made using PlumSpirit.
