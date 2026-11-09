@@ -1,0 +1,9 @@
+id = "plumspirit.example.note-service"
+name = "Composable Note Service"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Author-written deterministic pattern and note-column transformation services."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["services.provide"]

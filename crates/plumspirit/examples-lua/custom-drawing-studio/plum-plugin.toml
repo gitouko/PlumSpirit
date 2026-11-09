@@ -1,0 +1,6 @@
+id = "plumspirit.example.custom-drawing-studio"
+name = "Custom Drawing Studio"
+version = "0.2.0"
+api = "0.2"
+entry = "main.lua"
+capabilities = ["project.read", "notes.edit", "tools.draw"]

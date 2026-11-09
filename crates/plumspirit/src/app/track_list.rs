@@ -26,6 +26,7 @@ use egui::{
     Sense, Stroke, Vec2,
 };
 use plumspirit_engine::editor::clips;
+use plumspirit_engine::history::Operation;
 use plumspirit_engine::model::timing::snap_nearest;
 use plumspirit_engine::model::{ClipId, PlumDocument};
 use plumspirit_engine::model::{ContentRef, NoteStore};
@@ -3169,6 +3170,8 @@ impl super::PlumSpiritApp {
         let conductor = self.conductor_selected();
         let geometry = std::mem::take(&mut self.row_geometry);
         let selected_tracks = self.selected_tracks.clone();
+        let can_paste = self.has_musical_clipboard()
+            || self.clip_clipboard.as_ref().is_some_and(|c| !c.is_empty());
         let input = TrackListInput {
             doc: &doc,
             generation,
@@ -3203,7 +3206,7 @@ impl super::PlumSpiritApp {
                 Some(super::dialogs::Dialog::RepeatClips(d)) => d.outline.clone(),
                 _ => None,
             },
-            can_paste: self.clip_clipboard.as_ref().is_some_and(|c| !c.is_empty()),
+            can_paste,
             overlay_chips: super::progressor::overlay_controls(&self.overlay_views),
         };
         let out = self.track_list.show(ui, input);
@@ -3269,10 +3272,20 @@ impl super::PlumSpiritApp {
         // B1-0097: the clip clipboard and Slice.
         let intent = match intent {
             ClipIntent::Copy(ids) => {
-                self.copy_clips(&doc, &ids);
+                if self.uses_system_clipboard() {
+                    drop(doc);
+                    self.request_clip_copy(ids, false);
+                } else {
+                    self.copy_clips(&doc, &ids);
+                }
                 return;
             }
             ClipIntent::Cut(ids) => {
+                if self.uses_system_clipboard() {
+                    drop(doc);
+                    self.request_clip_copy(ids, true);
+                    return;
+                }
                 let copied = self.copy_clips(&doc, &ids);
                 // The document is shared until this clone goes.
                 drop(doc);
@@ -3420,13 +3433,6 @@ impl super::PlumSpiritApp {
         let Some(doc) = self.open.as_ref().map(|o| o.doc.clone()) else {
             return;
         };
-        let Some(clip) = self.clip_clipboard.clone() else {
-            self.set_status(
-                "Copy or cut clips first: there is nothing to paste.",
-                crate::ui::status_bar::StatusKind::Warning,
-            );
-            return;
-        };
         if track.is_none() && self.conductor_selected() {
             self.set_status(
                 "Clips paste on a track: choose a track first (the Conductor holds no clips).",
@@ -3437,7 +3443,20 @@ impl super::PlumSpiritApp {
         let track = track.unwrap_or_else(|| self.active_track());
         let at = at.unwrap_or(self.roll.cursor_tick);
         let first_new = doc.clips().layout().next_clip;
-        let op = match plumspirit_engine::editor::clips::paste_clips(&doc, &clip, track, at) {
+        if self.uses_system_clipboard() {
+            self.request_clipboard_paste(Some((track, at)));
+            return;
+        }
+        let Some(clip) = self.clip_clipboard.as_ref() else {
+            self.set_status(
+                "Copy or cut clips first: there is nothing to paste.",
+                crate::ui::status_bar::StatusKind::Warning,
+            );
+            return;
+        };
+        let n = clip.entries.len() as u32;
+        let op = plumspirit_engine::editor::clips::paste_clips(&doc, clip, track, at);
+        let op = match op {
             Ok(op) => op,
             Err(e) => {
                 self.set_status(e.to_string(), crate::ui::status_bar::StatusKind::Error);
@@ -3445,8 +3464,11 @@ impl super::PlumSpiritApp {
             }
         };
         drop(doc);
+        self.finish_clip_paste(op, first_new, n);
+    }
+
+    pub(super) fn finish_clip_paste(&mut self, op: Operation, first_new: u32, n: u32) {
         if self.apply_op(op).is_some() {
-            let n = clip.entries.len() as u32;
             self.track_list.selected = (0..n).map(|k| ClipId::Placed(first_new + k)).collect();
             self.set_status(
                 format!(

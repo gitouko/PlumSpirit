@@ -1,0 +1,9 @@
+id = "plumspirit.example.reactive-monitor"
+name = "Reactive Project Monitor"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Bounded read-only project observation; author-written event history and summary."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "project.observe"]

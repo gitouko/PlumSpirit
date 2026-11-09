@@ -853,7 +853,9 @@ fn eval(k: &Kind, b: &Gbox, t: f64) -> P2 {
 
 /// The clamped uniform cubic B-spline of control points `p` at `t`
 /// (through the first and the last).
-fn bspline(p: &[P2], t: f64) -> P2 {
+/// Uses the native generator's repeated end controls and uniform parameter spans.
+/// Callers exposing untrusted input must bound/validate controls and parameter.
+pub fn bspline(p: &[(f64, f64)], t: f64) -> (f64, f64) {
     match p.len() {
         0 => (0.0, 0.0),
         1 => p[0],
@@ -887,7 +889,9 @@ fn bspline(p: &[P2], t: f64) -> P2 {
 
 /// The uniform Catmull-Rom spline through `p` at `t` (the ends extended by
 /// reflection).
-fn catmull(p: &[P2], t: f64) -> P2 {
+/// Uses the native generator's reflected end controls and uniform parameter spans.
+/// Callers exposing untrusted input must bound/validate controls and parameter.
+pub fn catmull(p: &[(f64, f64)], t: f64) -> (f64, f64) {
     match p.len() {
         0 => (0.0, 0.0),
         1 => p[0],

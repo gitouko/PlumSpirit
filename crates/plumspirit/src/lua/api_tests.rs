@@ -263,3 +263,93 @@ fn rows_list_the_conductor_folders_and_tracks_like_the_track_list() {
     );
     assert_eq!(r, Plain::Boolean(true));
 }
+
+#[test]
+fn subchannel_note_color_matches_native_palettes_all_velocities_and_keeps_snapshot() {
+    use crate::ui::theme::{NoteColorMode, NoteColorPrefs, NotePalette};
+    let (d, mut history) = song();
+    for mode in NoteColorMode::ALL {
+        for dark in [false, true] {
+            for seed in [0, 9_123_456] {
+                let palette = Arc::new(NotePalette::new(NoteColorPrefs {
+                    mode,
+                    seed,
+                    manual: vec![[255, 0, 0], [7, 40, 190]],
+                }));
+                let mut src = String::from(
+                    "local subs=plum.project.current():track(1):subchannels();local s=subs[2];local a=s:note_color();local b=s:note_color(100);assert(a.r==b.r and a.g==b.g and a.b==b.b);a.r=-1;assert(s:note_color().r>=0); ",
+                );
+                for (i, id) in [0, 1].into_iter().enumerate() {
+                    for v in 1..=127 {
+                        let c = palette.entry(id, v, dark).fill;
+                        src.push_str(&format!("do local c=subs[{}]:note_color({v});assert(c.r=={} and c.g=={} and c.b=={})end;",i+1,c.r(),c.g(),c.b()));
+                    }
+                }
+                src.push_str("return true");
+                assert_eq!(
+                    run_with(
+                        &d,
+                        &mut history,
+                        ProjectInfo {
+                            dark,
+                            note_palette: palette.clone(),
+                            ..Default::default()
+                        },
+                        &src
+                    ),
+                    Plain::Boolean(true)
+                );
+            }
+        }
+    }
+}
+#[test]
+fn subchannel_note_color_rejects_invalid_arguments_wrong_family_expiry_and_missing_grant() {
+    let (mut d, mut history) = song();
+    history.observe_ids(&d);
+    let w = World::new(Arc::new(d.clone()), history.incarnations().snapshot());
+    let id = d.track(0).unwrap().id();
+    let sub = w.subchannel(id, SubchannelId(1)).unwrap();
+    let host = Host::new(Limits::default(), [Capability::ReadProject]).unwrap();
+    host.set_world(Some(w.clone()));
+    host.set_global_handle("sub", sub.clone()).unwrap();
+    assert_eq!(
+        host.run(
+            "invalid-color.lua",
+            r#"
+      for _,v in ipairs({0,128,-1,1.5,100.0,'100',false,{}})do
+        local ok,e=pcall(function()sub:note_color(v)end)
+        assert(not ok and tostring(e):find('integer velocity',1,true),tostring(e))
+      end
+      local ok,e=pcall(function()plum.project.current():track(1):note_color()end)
+      assert(not ok and tostring(e):find('not available',1,true));return true
+    "#
+        )
+        .unwrap(),
+        Plain::Boolean(true)
+    );
+    let denied = Host::new(Limits::default(), []).unwrap();
+    denied.set_world(Some(w));
+    denied.set_global_handle("sub", sub).unwrap();
+    assert_eq!(
+        denied
+            .run("denied.lua", "return sub:note_color()")
+            .unwrap_err()
+            .category,
+        Category::Capability
+    );
+    history
+        .apply(&mut d, Operation::DeleteTrack { index: 0 })
+        .unwrap();
+    history.observe_ids(&d);
+    host.set_world(Some(World::new(
+        Arc::new(d),
+        history.incarnations().snapshot(),
+    )));
+    assert_eq!(
+        host.run("expired-color.lua", "return sub:note_color()")
+            .unwrap_err()
+            .category,
+        Category::Expired
+    );
+}

@@ -61,6 +61,9 @@ impl PlumSpiritApp {
 
     /// The open project as plugins read it (`None`: no project).
     pub(super) fn lua_world(&mut self, dark: bool) -> Option<World> {
+        let playback = self.lua_playback_snapshot();
+        let playback_resources = self.transport.midi_resources();
+        let views = self.lua_view_snapshots();
         let time = self.time_selection;
         let selected_tracks: Vec<_> = self.selected_tracks.iter().copied().collect();
         let selected_clips: Vec<_> = self.track_list.selected.iter().copied().collect();
@@ -91,11 +94,15 @@ impl PlumSpiritApp {
             dirty,
             revision: o.history.current_state(),
             dark,
+            note_palette: Arc::new(super::note_colors::palette_of(&self.settings)),
             collapsed,
             active_track,
             selected_tracks,
             selected_clips,
             time_selection: time,
+            playback,
+            playback_resources,
+            views,
         };
         Some(World::new(Arc::clone(&o.doc), o.history.incarnations().snapshot()).with_info(info))
     }
@@ -108,7 +115,7 @@ impl PlumSpiritApp {
         };
         m.plugins()
             .iter()
-            .filter(|p| p.status == Status::Ready && !p.decls.commands.is_empty())
+            .filter(|p| p.status == Status::Ready && (!p.decls.commands.is_empty()||!p.decls.formats.is_empty()))
             .map(|p| {
                 (
                     p.id.clone(),
@@ -125,6 +132,10 @@ impl PlumSpiritApp {
                             };
                             (c.id.clone(), name, c.tooltip.clone())
                         })
+                        .chain(p.decls.formats.iter().flat_map(|f|[crate::lua::formats::Mode::Import,crate::lua::formats::Mode::Export].into_iter().filter(|mode|f.supports(*mode)).map(|mode| {
+                            (super::lua_formats::action(mode,&f.id),format!("{} {}…",if mode==crate::lua::formats::Mode::Import {"Import"}else {"Export"},f.name),
+                            "Choose a file for this plugin's registered format. Imports are reviewed before Apply.".into())
+                        })))
                         .collect(),
                 )
             })
@@ -134,6 +145,9 @@ impl PlumSpiritApp {
     /// Every frame: plugin results, project open / close, repaint while
     /// busy. Cheap when no plugin runs.
     pub(super) fn poll_lua_plugins(&mut self, ctx: &egui::Context) {
+        self.capture_lua_views();
+        self.collect_lua_overlays();
+        self.poll_lua_file_dialog(ctx);
         let dark = ctx.theme() == egui::Theme::Dark;
         if self.lua_plugins.is_none() {
             if !self.lua_plugins_started {
@@ -165,6 +179,7 @@ impl PlumSpiritApp {
         // Project open / close (by document generation).
         let generation = self.open.as_ref().map(|o| o.generation);
         if generation != self.lua_plugins_generation {
+            self.lua_automation.clear();
             let had = self.lua_plugins_generation.is_some();
             self.lua_plugins_generation = generation;
             if had {
@@ -176,16 +191,51 @@ impl PlumSpiritApp {
                 self.lua_plugins().project_opened(w);
             }
         }
+        self.sample_lua_surfaces();
+        self.sample_lua_observation();
+        self.poll_lua_playback_controls();
+        self.sample_lua_playback();
         let prefs = self.settings.lua_plugins.clone();
         let events = self.lua_plugins().poll(&prefs);
         for e in events {
             match e {
+                PluginEvent::TransportLoop {
+                    plugin,
+                    intent,
+                    lifecycle,
+                } => self.apply_lua_loop_intent(&plugin, intent, &lifecycle),
+                PluginEvent::TransportMidi {
+                    plugin,
+                    intent,
+                    lifecycle,
+                } => self.apply_lua_midi_intent(&plugin, intent, &lifecycle),
+                PluginEvent::DiscardMidi(intent) => super::project::reap(intent),
                 PluginEvent::Commits {
                     plugin,
                     command,
                     commits,
                 } => self.apply_lua_commits(&plugin, &command, commits),
+                PluginEvent::FormatResult {
+                    plugin,
+                    format,
+                    mode,
+                    selected,
+                    result,
+                    lifecycle,
+                } => self.lua_format_result(&plugin, &format, mode, selected, result, lifecycle),
                 PluginEvent::Select { ui, .. } => self.apply_lua_selection(ui),
+                PluginEvent::ResponseRequest {
+                    plugin,
+                    delivery,
+                    request,
+                } => self.start_lua_response(&plugin, delivery, request, dark),
+                PluginEvent::ResponseResult {
+                    plugin,
+                    delivery,
+                    commits,
+                    guard,
+                    notices,
+                } => self.apply_lua_response(&plugin, delivery, commits, *guard, notices),
                 PluginEvent::Notice { text, error } => self.set_status(
                     text,
                     if error {
@@ -194,6 +244,22 @@ impl PlumSpiritApp {
                         StatusKind::Info
                     },
                 ),
+                PluginEvent::ObservationNotice {
+                    delivery,
+                    text,
+                    error,
+                } => {
+                    if self.lua_observation_delivery_valid(&delivery) {
+                        self.set_status(
+                            text,
+                            if error {
+                                StatusKind::Error
+                            } else {
+                                StatusKind::Info
+                            },
+                        );
+                    }
+                }
                 PluginEvent::NeedWorld => {
                     if let Some(w) = self.lua_world(dark) {
                         self.lua_plugins().supply_world(w);
@@ -202,6 +268,7 @@ impl PlumSpiritApp {
                 PluginEvent::DeclsChanged => {}
                 PluginEvent::ProjectData { plugin, text } => {
                     if let Some(g) = self.open.as_ref().map(|o| o.generation) {
+                        self.custom_project_data_staged();
                         self.lua_project_data.push((g, plugin, text));
                     }
                 }
@@ -215,11 +282,72 @@ impl PlumSpiritApp {
             }
         }
         self.store_lua_project_data();
-        if self
-            .lua_plugins
-            .as_ref()
-            .is_some_and(PluginManager::is_busy)
+        self.maintain_lua_format();
+        self.poll_lua_file_dialog(ctx);
+        self.poll_lua_midi_input(ctx);
+        if let Some(manager) = self.lua_plugins.as_ref() {
+            if manager.is_busy() || self.lua_observation_sampling() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            } else if manager.observing()
+                || manager.observing_playback()
+                || manager.observing_surfaces()
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Permission/revision checks continue while a native picker has focus.
+    fn poll_lua_file_dialog(&mut self, ctx: &egui::Context) {
+        use crate::lua::bridge::{BridgeError, ProjectStamp};
+        let current = self.open.as_ref().map(|o| ProjectStamp {
+            serial: o.history.incarnations().project(),
+            revision: o.history.current_state(),
+        });
+        let allowed = |plugin: &str, save: bool| {
+            let prefs = &self.settings.lua_plugins;
+            let state = prefs.installed.get(plugin);
+            prefs.run_plugins
+                && state.is_some_and(|s| s.enabled)
+                && self.lua_plugins.as_ref().is_some_and(|m| {
+                    m.plugins().iter().any(|p| {
+                        p.id == plugin
+                            && p.effective(state).contains(&if save {
+                                Capability::WriteUserFile
+                            } else {
+                                Capability::ReadUserFile
+                            })
+                    })
+                })
+        };
+        if let Some(dialog) = self.lua_file_dialog.as_ref() {
+            let permitted = dialog.plugin().is_some_and(|id| allowed(id, dialog.save()));
+            if self
+                .lua_file_dialog
+                .as_mut()
+                .unwrap()
+                .poll(current, permitted)
+            {
+                self.lua_file_dialog = None;
+            }
+        }
+        if self.lua_file_dialog.is_none()
+            && !self.lua_midi_input.pending()
+            && self.dialog.is_none()
+            && let Some(request) = self
+                .lua_plugins
+                .as_ref()
+                .and_then(PluginManager::poll_ui_request)
         {
+            if !request.lease.matches_project(current) {
+                request.reject(BridgeError::Expired);
+            } else if !allowed(request.lease.plugin.as_ref(), request.spec.save) {
+                request.reject(BridgeError::NotUserInvoked);
+            } else {
+                self.lua_file_dialog = super::lua_file_dialog::NativeFileDialog::start(request);
+            }
+        }
+        if self.lua_file_dialog.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -317,6 +445,7 @@ impl PlumSpiritApp {
         // The manager exists once the window is shown.
         self.lua_plugins();
         let m = self.lua_plugins.as_ref().expect("created above");
+        let overlay_controls = &mut self.lua_overlays;
         let w = &mut self.lua_plugins_window;
         let mut want_help = false;
         egui::Window::new("Lua Plugins")
@@ -403,6 +532,7 @@ impl PlumSpiritApp {
                         }
                     }
                 });
+                overlay_controls.controls(ui);
                 if let Some((text, error)) = &w.message {
                     let color = if *error {
                         ui.visuals().error_fg_color
@@ -717,6 +847,21 @@ enum UiAction {
 /// What a capability lets a plugin do, for the checkbox's tooltip.
 fn capability_words(c: Capability) -> &'static str {
     match c {
+        Capability::ReadMidiInput => {
+            "Discover MIDI input names and request access to a device you select and explicitly approve for each command. Receives bounded short MIDI messages on the Lua worker; access ends on command completion, cancellation, project change or permission revocation."
+        }
+        Capability::UiOverlay => {
+            "Draw bounded worker-authored editor overlays, receive bounded surface notifications, read authorized visible coordinates and retain project-scoped UI image pixels. Piano Roll geometry also needs project read; Player geometry also needs playback read. No note editing, input interception, file access or GPU access."
+        }
+        Capability::EmitMidi => {
+            "Send bounded precomputed MIDI plans to isolated internal playback voices from explicit commands. Requires playback read, running playback and a SoundFont. Does not edit notes or access shared external MIDI routes."
+        }
+        Capability::ControlPlayback => {
+            "Request play, pause, stop, seek and audition speed from explicitly invoked plugin commands; requests are bounded and rejected after competing actions. Playback read permission is also required."
+        }
+        Capability::ReadPlayback => {
+            "Read captured playback position, state, loop, speed and Conductor timing; receive bounded worker notifications. This does not control playback or read notes."
+        }
         Capability::ReadProject => {
             "Read the open project: tracks, clips, notes, events, the Conductor and the selection."
         }
@@ -725,8 +870,32 @@ fn capability_words(c: Capability) -> &'static str {
         }
         Capability::EditTracks => "Add, remove and change tracks, subtracks, folders and clips.",
         Capability::EditConductor => "Change the tempo, time signatures and markers.",
+        Capability::DrawingTools => {
+            "Receive completed pointer strokes only while you select this plugin's drawing tool in the Piano Roll (tools.draw)."
+        }
+        Capability::UiPanels => {
+            "Open custom panels and interactive canvases when you invoke the plugin; close the window to cancel its job."
+        }
         Capability::ReadUserFile => "Read a file you choose in a dialog.",
+        Capability::ListFonts => {
+            "List installed font families/styles and load their font data for creative tools. This does not allow arbitrary file access."
+        }
         Capability::WriteUserFile => "Write a file you choose in a dialog.",
+        Capability::ObserveProject => {
+            "Receive bounded project-change notifications on a worker; observation handlers cannot edit the project."
+        }
+        Capability::EditMetadata => {
+            "Save or remove this plugin's typed project attributes through Preview / Undo."
+        }
+        Capability::CallServices => {
+            "Call declared services in other enabled plugins using bounded plain data; provider project/UI authority is restricted."
+        }
+        Capability::ProvideServices => {
+            "Publish bounded plain-data services on the plugin worker; no project or UI writes in service jobs."
+        }
+        Capability::AutomateProject => {
+            "Allow event handlers to request bounded automatic note edits with Undo; note-edit permission is also required."
+        }
     }
 }
 
@@ -785,6 +954,16 @@ fn details(
                         actions.push(UiAction::Grant(p.id.clone(), c.clone(), on));
                     }
                 }
+            }
+            for dependency in &m.service_dependencies {
+                ui.label(format!("Service dependency: {}", dependency.text()));
+            }
+            for service in &p.decls.services {
+                ui.label(format!(
+                    "Provides: {} v{}",
+                    service.namespace,
+                    service.version.text()
+                ));
             }
             if !p.decls.commands.is_empty() {
                 ui.label(format!(
@@ -850,6 +1029,42 @@ mod tests {
     use crate::lua::plugins::Status;
     use plumspirit_engine::model::{Bpm, NoteAttrs, NoteOffKind, NoteRecord, PlumDocument};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn worker_world_captures_actual_note_palette_without_live_settings_access() {
+        use crate::ui::theme::{NoteColorMode, NotePalette};
+        let mut h = Harness::new(doc());
+        h.app.settings.note_colors.mode = NoteColorMode::Manual;
+        h.app.settings.note_colors.manual = vec![[11, 27, 173]];
+        let w = h.app.lua_world(false).unwrap();
+        let expected = NotePalette::new(h.app.settings.note_colors.clone())
+            .entry(0, 100, false)
+            .fill;
+        h.app.settings.note_colors.manual[0] = [250, 190, 2];
+        let host = crate::lua::Host::new(
+            crate::lua::Limits::default(),
+            [crate::lua::Capability::ReadProject],
+        )
+        .unwrap();
+        host.set_world(Some(w));
+        let script = format!(
+            "local c=plum.project.current():track(1):subchannels()[1]:note_color();return c.r=={} and c.g=={} and c.b=={}",
+            expected.r(),
+            expected.g(),
+            expected.b()
+        );
+        assert_eq!(
+            host.run("captured-palette.lua", &script).unwrap(),
+            crate::lua::Plain::Boolean(true)
+        );
+        assert_ne!(
+            expected,
+            NotePalette::new(h.app.settings.note_colors.clone())
+                .entry(0, 100, false)
+                .fill
+        );
+        assert!(!h.app.enabled(Command::Undo));
+    }
 
     fn doc() -> PlumDocument {
         let mut d = PlumDocument::new_project("Song".into(), Bpm::DEFAULT, 960);
@@ -1014,9 +1229,17 @@ mod tests {
 
     #[test]
     fn the_examples_install_from_the_window_and_appear_in_their_menus() {
-        let root =
-            std::env::temp_dir().join(format!("plumspirit-app-examples-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        let root = base.join(format!("plumspirit-app-examples-{}", std::process::id()));
+        let cleanup = || {
+            if root.exists() {
+                let resolved = root.canonicalize().unwrap();
+                assert_eq!(resolved.parent(), Some(base.as_path()));
+                assert_eq!(resolved.file_name(), root.file_name());
+                std::fs::remove_dir_all(resolved).unwrap();
+            }
+        };
+        cleanup();
         let mut h = Harness::new(doc());
         h.app.settings.lua_plugins.folder = Some(root.join("plugins"));
         assert!(h.command(Command::ShowLuaPlugins));
@@ -1036,9 +1259,21 @@ mod tests {
                 "nothing allowed by installing"
             );
             assert_eq!(st.origin, crate::lua::package::Origin::Example);
-            for cap in ["project.read", "notes.edit"] {
+            let requested = h
+                .app
+                .lua_plugins
+                .as_ref()
+                .unwrap()
+                .plugin(ex.id)
+                .unwrap()
+                .manifest
+                .as_ref()
+                .unwrap()
+                .capabilities
+                .clone();
+            for cap in requested {
                 h.app
-                    .lua_plugins_action(UiAction::Grant(ex.id.into(), cap.into(), true), &frame);
+                    .lua_plugins_action(UiAction::Grant(ex.id.into(), cap, true), &frame);
             }
             h.app
                 .lua_plugins_action(UiAction::Enable(ex.id.into(), true), &frame);
@@ -1051,9 +1286,92 @@ mod tests {
             })
         });
         let tools = h.app.custom_tool_menu();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].2[0].1, "Graph Shift", "Tools > Custom");
+        assert_eq!(tools.len(), 5);
+        let legacy = tools
+            .iter()
+            .find(|t| t.0 == "plumspirit.example.graph-shift")
+            .unwrap();
+        assert_eq!(legacy.2[0].1, "Graph Shift", "Tools > Custom");
+        let studio = tools
+            .iter()
+            .find(|t| t.0 == "plumspirit.example.custom-drawing-studio")
+            .unwrap();
+        assert_eq!(studio.2.len(), 5);
+        let image = tools
+            .iter()
+            .find(|t| t.0 == "plumspirit.example.image-art-studio")
+            .unwrap();
+        assert_eq!(image.2.len(), 2);
+        let text = tools
+            .iter()
+            .find(|t| t.0 == "plumspirit.example.text-art-studio")
+            .unwrap();
+        assert_eq!(text.2.len(), 2);
+        assert_eq!(text.2[0].0, "composition");
+        assert_eq!(text.2[1].0, "color-artwork");
+        let midi = tools
+            .iter()
+            .find(|t| t.0 == "plumspirit.example.midi-input-laboratory")
+            .unwrap();
+        assert_eq!(midi.2.len(), 1);
+        assert_eq!(midi.2[0].0, "replay");
         let menu = h.app.lua_menu();
+        let fonts = menu
+            .iter()
+            .find(|p| p.0 == "plumspirit.example.font-resources")
+            .unwrap();
+        assert_eq!(fonts.2.len(), 4);
+        assert!(fonts.2.iter().any(|c| c.0 == "choose-installed"));
+        for (id, command) in [
+            ("plumspirit.example.file-transform", "uppercase-text"),
+            ("plumspirit.example.geometry-primitives", "draw-path"),
+            ("plumspirit.example.metadata-notebook", "remember"),
+            ("plumspirit.example.service-composer", "generate"),
+            ("plumspirit.example.reactive-monitor", "summary"),
+            ("plumspirit.example.reactive-velocity", "clamp"),
+        ] {
+            let item = menu
+                .iter()
+                .find(|p| p.0 == id)
+                .expect("Embedded sample command menu");
+            assert!(
+                item.2.iter().any(|c| c.0 == command),
+                "Missing command {id}/{command}"
+            );
+        }
+        let manager = h.app.lua_plugins.as_ref().unwrap();
+        assert_eq!(
+            manager
+                .plugin("plumspirit.example.note-service")
+                .unwrap()
+                .decls
+                .services
+                .len(),
+            2
+        );
+        assert_eq!(
+            manager
+                .plugin("plumspirit.example.reactive-monitor")
+                .unwrap()
+                .decls
+                .observers
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager
+                .plugin("plumspirit.example.reactive-velocity")
+                .unwrap()
+                .decls
+                .observers
+                .len(),
+            1
+        );
+        let transport = menu
+            .iter()
+            .find(|p| p.0 == "plumspirit.example.transport-monitor")
+            .unwrap();
+        assert_eq!(transport.2[0].1, "Capture Transport Snapshot");
         let cc = menu
             .iter()
             .find(|p| p.0 == "plumspirit.example.cc-batch")
@@ -1072,6 +1390,7 @@ mod tests {
         let msg = h.app.lua_plugins_window.message.clone().unwrap();
         assert!(msg.0.starts_with("Restored the example"), "{msg:?}");
         assert!(h.app.settings.lua_plugins.installed["plumspirit.example.cc-batch"].enabled);
-        let _ = std::fs::remove_dir_all(&root);
+        drop(h);
+        cleanup();
     }
 }

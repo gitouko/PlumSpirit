@@ -21,6 +21,13 @@ Escape (or a right-click while drawing or erasing) cancels a drag. Right-click a
 the note menu: every tool by kind, Mute / Unmute, Slice, Delete, Repeat Last Tool and the
 recent tools.
 
+## Copy between projects
+
+On Windows, select notes and use {key:Copy} or {key:Cut}. In a second
+PlumSpirit window, open an editable Piano Roll, place the edit cursor and
+use {key:Paste}. Groups and Subchannels travel with the notes. A different
+PPQN preserves beat positions, and each paste can be undone in its own project.
+
 ## Gate, velocity, quantize
 
 * **Gate** and **Vel** in the toolbar show the selected notes' length (ticks) and velocity;

@@ -22,6 +22,7 @@ mod archive_open;
 mod audio_settings;
 mod autobackup;
 mod bench;
+mod canvas;
 mod clip_keys;
 mod clip_merge_ui;
 mod clip_repeat_ui;
@@ -46,14 +47,25 @@ pub(crate) mod hierarchy;
 mod history_ui;
 mod image_midi;
 mod inspector_view;
-pub mod jobs;
+pub(crate) mod jobs;
 pub mod keybinds;
 pub mod keys;
 #[cfg(test)]
 mod layout_audit;
 mod live;
+mod lua_file_dialog;
+mod lua_formats;
+#[cfg(test)]
+mod lua_metadata_tests;
+mod lua_midi_input;
+mod lua_overlays;
+mod lua_panels;
+mod lua_playback;
 mod lua_plugins_ui;
+mod lua_views;
+mod musical_clipboard;
 mod plugin_commands;
+mod reactive_observation;
 pub use lua_plugins_ui::MenuPlugin as LuaMenuPlugin;
 mod color_presets;
 mod merge;
@@ -61,6 +73,8 @@ mod note_colors;
 pub mod note_menu;
 mod onion_defaults;
 mod paste_ui;
+#[cfg(all(test, windows))]
+mod perf_api02_tests;
 mod playback;
 mod player_view;
 pub(crate) mod plugin_memory;
@@ -77,7 +91,7 @@ mod selection_charts;
 mod selection_stats;
 mod settings_window;
 mod song;
-mod spiderweb;
+pub(crate) mod spiderweb;
 mod subchannels;
 pub mod tasks;
 #[cfg(test)]
@@ -399,6 +413,9 @@ pub struct PlumSpiritApp {
     /// The chosen custom function's text and parse result.
     custom_expr: Option<(String, Result<Expr, String>)>,
     event_clipboard: Option<graphs::EventClipboard>,
+    clipboard_ctx: egui::Context,
+    clipboard_backend: musical_clipboard::Backend,
+    clipboard_origin: Option<(u32, u64)>,
     /// Tracks Ctrl+clicked in the track list (Select Range scope).
     selected_tracks: BTreeSet<TrackId>,
     /// v0.8 §081–§082: THE time selection `[start, end)` — set by a drag on
@@ -436,10 +453,22 @@ pub struct PlumSpiritApp {
     lua_plugins: Option<crate::lua::plugins::PluginManager>,
     lua_plugins_started: bool,
     lua_plugins_generation: Option<u64>,
+    lua_observation: reactive_observation::ObservationState,
+    lua_playback: lua_playback::Sampling,
+    lua_playback_controls: crate::lua::playback::control::Admission,
+    lua_views: crate::lua::visual::Capture,
+    lua_automation: crate::lua::response::Gate,
     /// B1-0035: plugin project data waiting for the document
     /// (generation, plugin id, JSON; empty JSON removes it).
     lua_project_data: Vec<(u64, String, String)>,
     lua_plugins_window: lua_plugins_ui::LuaPluginsWindow,
+    lua_file_dialog: Option<lua_file_dialog::NativeFileDialog>,
+    lua_formats: lua_formats::State,
+    lua_midi_input: lua_midi_input::State,
+    lua_panels: Vec<lua_panels::View>,
+    lua_overlays: lua_overlays::Overlays,
+    lua_upload_pixels: usize,
+    lua_upload_frame: Option<u64>,
     /// B1-0050: the Help window (F1).
     pub(crate) help: help::HelpWindow,
     /// B1-0045: the open custom tool window (Tools → Custom).
@@ -457,6 +486,7 @@ pub struct PlumSpiritApp {
     export_options: plumspirit_engine::midi::ExportOptions,
     /// Follow Playhead is on but paused: the user scrolled during playback.
     follow_suspended: bool,
+    seek_follow_view: Option<(plumspirit_engine::view::TimeAxis, i128)>,
     zoom_x_field: NumericField,
     zoom_y_field: NumericField,
     gate_field: NumericField,
@@ -754,6 +784,9 @@ impl PlumSpiritApp {
             event_list_open: false,
             custom_expr: None,
             event_clipboard: None,
+            clipboard_ctx: ctx.clone(),
+            clipboard_backend: musical_clipboard::Backend::default(),
+            clipboard_origin: None,
             selected_tracks: BTreeSet::new(),
             time_selection: None,
             time_cache: None,
@@ -773,8 +806,20 @@ impl PlumSpiritApp {
             lua_plugins: None,
             lua_plugins_started: false,
             lua_plugins_generation: None,
+            lua_observation: Default::default(),
+            lua_playback: Default::default(),
+            lua_playback_controls: Default::default(),
+            lua_views: Default::default(),
+            lua_automation: Default::default(),
             lua_project_data: Vec::new(),
             lua_plugins_window: lua_plugins_ui::LuaPluginsWindow::default(),
+            lua_file_dialog: None,
+            lua_formats: Default::default(),
+            lua_midi_input: Default::default(),
+            lua_panels: Vec::new(),
+            lua_overlays: Default::default(),
+            lua_upload_pixels: crate::lua::ui::images::MAX_UPLOAD_PIXELS,
+            lua_upload_frame: None,
             help: help::HelpWindow::default(),
             custom_tool: None,
             lua_command_dialog: None,
@@ -822,6 +867,7 @@ impl PlumSpiritApp {
             settings_save_at: None,
             export_options: plumspirit_engine::midi::ExportOptions::default(),
             follow_suspended: false,
+            seek_follow_view: None,
             zoom_x_field: NumericField::default(),
             zoom_y_field: NumericField::default(),
             gate_field: NumericField::default(),
@@ -1009,7 +1055,12 @@ impl PlumSpiritApp {
     fn busy_with_writer(&self) -> bool {
         matches!(
             self.job.as_ref().map(|j| &j.kind),
-            Some(JobKind::Export { .. } | JobKind::Edit { .. } | JobKind::Save { .. })
+            Some(
+                JobKind::Export { .. }
+                    | JobKind::Edit { .. }
+                    | JobKind::Save { .. }
+                    | JobKind::Clipboard { .. }
+            )
         )
     }
 
@@ -1035,6 +1086,9 @@ impl PlumSpiritApp {
 
     /// Whether a command can act right now. Menus, toolbar and shortcuts all use this.
     pub fn enabled(&self, cmd: Command) -> bool {
+        if self.lua_formats.reviewing() {
+            return false;
+        }
         let has_doc = self.open.is_some();
         let idle = self.job.is_none();
         let selected = self.selected_count() > 0;
@@ -1052,7 +1106,7 @@ impl PlumSpiritApp {
                 Command::SelectAll => return true,
                 Command::Copy if clips => return true,
                 Command::Cut | Command::Delete | Command::SliceNotes if clips => return idle,
-                Command::Paste if self.clip_clipboard.is_some() => {
+                Command::Paste if self.uses_system_clipboard() || self.clip_clipboard.is_some() => {
                     return idle && !conductor;
                 }
                 _ => {}
@@ -1108,6 +1162,13 @@ impl PlumSpiritApp {
                     && (selected
                         || self.graphs.views[self.active_graph]
                             .has_point_selection(self.shown_target(self.active_graph)))
+            }
+            Command::Paste if self.uses_system_clipboard() => {
+                has_doc
+                    && idle
+                    && (!conductor
+                        || self.shown_target(self.active_graph)
+                            == plumspirit_engine::model::GraphTarget::MasterVolume)
             }
             Command::Paste => {
                 // v0.8 §204: notes never paste into the Conductor.
@@ -1174,7 +1235,14 @@ impl PlumSpiritApp {
                 let s = self.summary.map(|(_, s)| s).unwrap_or_default();
                 has_doc && idle && s.muted > 0
             }
-            Command::Cut => has_doc && idle && selected,
+            Command::Cut => {
+                has_doc
+                    && idle
+                    && (selected
+                        || (self.graph_focus
+                            && self.graphs.views[self.active_graph]
+                                .has_point_selection(self.shown_target(self.active_graph))))
+            }
             Command::ZoomInY | Command::ZoomOutY | Command::FitKeys128 => has_doc,
             Command::FitAllKeys => {
                 has_doc
@@ -1419,7 +1487,9 @@ impl PlumSpiritApp {
                 self.apply_clip_intent(intent);
                 return;
             }
-            if cmd == Command::Paste && self.clip_clipboard.is_some() {
+            if cmd == Command::Paste
+                && (self.uses_system_clipboard() || self.clip_clipboard.is_some())
+            {
                 self.apply_clip_intent(track_list::ClipIntent::Paste {
                     track: None,
                     at: None,
@@ -1457,11 +1527,8 @@ impl PlumSpiritApp {
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
             Command::UndoHistory => self.history_window = true,
-            Command::Copy => {
-                if !(self.graph_focus && self.copy_graph_selection()) {
-                    self.copy();
-                }
-            }
+            Command::Copy => self.request_musical_copy(false),
+            Command::Paste if self.uses_system_clipboard() => self.paste_music(),
             Command::Paste => {
                 let graph_paste = self.graph_focus || self.clipboard.is_none();
                 if !(graph_paste && self.paste_graph_events()) {
@@ -1629,10 +1696,7 @@ impl PlumSpiritApp {
                 Some(cmd.label()),
                 ctx,
             ),
-            Command::Cut => {
-                self.execute(Command::Copy, ctx, frame);
-                self.execute(Command::Delete, ctx, frame);
-            }
+            Command::Cut => self.request_musical_copy(true),
             Command::FitKeys128 | Command::FitAllKeys => {
                 self.set_main_view(track_list::MainView::PianoRoll);
                 let hi = if cmd == Command::FitKeys128 { 127 } else { 255 };
@@ -2714,6 +2778,11 @@ impl PlumSpiritApp {
             *t = Instant::now();
         };
         log::info!("shutting down");
+        self.lua_file_dialog = None;
+        self.lua_midi_input.clear();
+        for view in self.lua_panels.drain(..) {
+            view.cancel();
+        }
         self.save_settings();
         lap("settings saved", &mut t);
         self.transport.shutdown();
@@ -2831,9 +2900,9 @@ impl PlumSpiritApp {
         // does not show) — `run_chord` decides, for the clipboard events too.
         // egui-winit turns Ctrl+C / Ctrl+V into `Event::Copy` / `Event::Paste(text)`
         // instead of key presses, and emits nothing at all for Ctrl+V while the system
-        // clipboard holds no text. PlumSpirit's note clipboard is internal, so a Paste
-        // event (whatever its text) pastes notes, and a Ctrl+V key *release* that was
-        // not preceded by a Paste event (empty or non-text system clipboard) does too.
+        // clipboard holds no text. Both the Paste event and a Ctrl+V release
+        // without that event request the current musical payload. Text fields
+        // keep their regular Paste event and are handled by the focus guard.
         let (mut copy, mut paste, mut cut) = (false, false, false);
         let held = ctx.input(|i| i.modifiers);
         let mut seen = self.paste_event_seen;
@@ -2841,19 +2910,20 @@ impl PlumSpiritApp {
             for e in &i.events {
                 match e {
                     Event::Copy => copy = true,
-                    // v0.8 §150: Ctrl+X (and Shift+Delete) delete the selection.
                     Event::Cut => cut = true,
                     Event::Paste(_) => {
                         paste = true;
                         seen = true;
                     }
                     Event::Key {
-                        key: Key::V,
+                        key,
                         pressed: false,
                         modifiers,
                         ..
-                    } if modifiers.command => {
-                        if !seen {
+                    } if matches!(key, Key::V | Key::Paste)
+                        || (cfg!(windows) && *key == Key::Insert && modifiers.shift) =>
+                    {
+                        if (*key != Key::V || modifiers.command) && !seen {
                             paste = true;
                         }
                         seen = false;
@@ -2903,9 +2973,11 @@ impl PlumSpiritApp {
             }
         });
         // Ctrl+X arrives as the Cut event above; never run it twice.
-        if cut {
-            fired.retain(|c| *c != cut_cmd);
-        }
+        fired.retain(|c| {
+            !((cut && *c == cut_cmd)
+                || (copy && *c == Command::Copy)
+                || (paste && *c == Command::Paste))
+        });
         if copy || paste || cut || !fired.is_empty() {
             // The roll was drawn before the shortcut acted; show the result now.
             ctx.request_repaint();
@@ -2929,7 +3001,10 @@ impl PlumSpiritApp {
             self.select_all_clips();
         } else if in_track_list && let Some(intent) = self.track_list.key_intent(c) {
             self.apply_clip_intent(intent);
-        } else if in_track_list && c == Command::Paste && self.clip_clipboard.is_some() {
+        } else if in_track_list
+            && c == Command::Paste
+            && (self.uses_system_clipboard() || self.clip_clipboard.is_some())
+        {
             // B1-0097: Ctrl+V pastes the copied clips at the edit cursor.
             self.apply_clip_intent(track_list::ClipIntent::Paste {
                 track: None,
@@ -3100,6 +3175,7 @@ pub(crate) fn format_clock(secs: f64) -> String {
 
 impl eframe::App for PlumSpiritApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.reset_lua_upload_budget(ui.ctx());
         // L-S48: where this update's time goes (the F12 overlay's slowest
         // update of the last 120).
         crate::diagnostics::FrameClock::app_started(ui.ctx());
@@ -3841,10 +3917,10 @@ impl eframe::App for PlumSpiritApp {
             let track_index = roll_target.host_track();
             let roll_title = session.and_then(|_| self.session_title());
             // B2-F15: locked (no clip; the Conductor has its own banner).
-            let roll_lock = self
+            let roll_lock = self.lua_formats.reviewing().then_some("Review the import, then Apply or Cancel.").or_else(||self
                 .note_lock()
                 .filter(|r| *r != clip_session::LockReason::Conductor)
-                .map(clip_session::LockReason::hint);
+                .map(clip_session::LockReason::hint));
             let (roll_content, roll_shift) = match session.map(|v| (v.target, v.shift)) {
                 Some((plumspirit_engine::editor::NoteTarget::Content { content, .. }, sh)) => {
                     (Some(content), sh)
@@ -3865,9 +3941,18 @@ impl eframe::App for PlumSpiritApp {
             };
             // Follow Playhead: a view feature driven by the transport position
             // (never by a timer), paused while the user scrolls by hand.
+            let roll_playhead = clip_session::shifted(self.transport.position(), -roll_shift);
+            if !running
+                || self.follow_suspended
+                || self.seek_follow_view != Some((self.roll.view.time, roll_shift))
+                || !(0.0..=self.roll.view_width()).contains(&self.roll.view.time.tick_to_x(roll_playhead))
+            {
+                self.seek_follow_view = None;
+            }
             if running
                 && self.settings.follow_playhead
                 && !self.follow_suspended
+                && self.seek_follow_view.is_none()
                 && !self.roll.is_dragging()
             {
                 let style = if self.settings.smooth_follow {
@@ -3876,7 +3961,7 @@ impl eframe::App for PlumSpiritApp {
                     FollowStyle::Page
                 };
                 self.roll.follow_playhead(
-                    clip_session::shifted(self.transport.position(), -roll_shift),
+                    roll_playhead,
                     clip_session::shifted(doc.duration_ticks(), -roll_shift),
                     style,
                     f64::from(self.settings.follow_position.min(100)) / 100.0,
@@ -3996,12 +4081,15 @@ impl eframe::App for PlumSpiritApp {
                 new_note_gate: self.settings.default_gate,
                 new_note_sub: new_sub,
                 preview: preview_kernel.as_ref().map(|(k, scope)| (k.as_ref(), *scope)),
-                capture: self.tool.as_ref().and_then(tools::ToolSession::capture_mode),
+                capture: self.tool.as_ref().and_then(tools::ToolSession::capture_mode)
+                    .or_else(||self.custom_tool.as_ref().and_then(custom_tools::CustomToolSession::capture_mode)),
                 stroke_overlay: self
                     .tool
                     .as_ref()
-                    .map_or(&[][..], |s| s.stroke_overlay.as_slice()),
-                tool_preview: tools::tool_preview(&self.tool, roll_target)
+                    .map(|s| s.stroke_overlay.as_slice())
+                    .or_else(||self.custom_tool.as_ref().map(|s|s.stroke_overlay.as_slice())).unwrap_or(&[]),
+                tool_preview: lua_formats::preview(&self.lua_formats,&doc,roll_target)
+                    .or_else(|| tools::tool_preview(&self.tool, roll_target))
                     .or_else(|| custom_tools::custom_preview(&self.custom_tool, roll_target))
                     .or_else(|| scores::score_preview(&self.score_insert))
                     .or_else(|| handles::transient_preview(&self.transient, roll_target))
@@ -4031,6 +4119,9 @@ impl eframe::App for PlumSpiritApp {
             }
             let mut roll_ui = ui.new_child(egui::UiBuilder::new().max_rect(roll_rect));
             actions = self.roll.show(&mut roll_ui, input, generation);
+            if let Some((painter, slot)) = self.roll.take_overlay_layer() {
+                self.paint_lua_overlays(&roll_ui, &painter, 0, Some(slot));
+            }
             // B1-0059: Hide Text Overlays leaves the notes unobstructed.
             let overlays = !self.settings.hide_text_overlays;
             // B1-0065: the readouts fade while the pointer is over them and
@@ -4385,8 +4476,10 @@ impl eframe::App for PlumSpiritApp {
         self.help_window_ui(&ctx, frame);
         self.lua_plugins_ui(&ctx, frame);
         self.poll_lua_plugins(&ctx);
+        self.lua_panel_windows(&ctx);
         self.custom_tool_ui(&ctx);
         self.plugin_commands_ui(&ctx);
+        self.lua_format_ui(&ctx);
         self.zoom_frame(&ctx);
         self.zoom_window_ui(&ctx);
         self.draw_zoom_lens(&ctx);

@@ -349,6 +349,130 @@ fn callbacks_inserts_and_duplicates_validate_every_note() {
 }
 
 #[test]
+fn direct_columns_match_rows_defaults_large_ticks_and_stable_equal_starts() {
+    let (doc, mut history) = project(0);
+    let rows = host_for(&doc, &mut history);
+    let columns = host_for(&doc, &mut history);
+    let row_hash = run(
+        &rows,
+        r#"
+        local p=plum.project.current();local tx=plum.transaction{}
+        tx:insert_notes(p:track(1),{
+            {start='9007199254740993',gate=1,key=64,velocity=9,channel=15},
+            {start='9007199254740992',gate=2,key=65},
+            {start='9007199254740993',gate=3,key=67,velocity=127}
+        })
+        tx:commit();return p:content_hash()
+    "#,
+    );
+    let column_hash = run(
+        &columns,
+        r#"
+        local p=plum.project.current();local tx=plum.transaction{}
+        tx:insert_notes(p:track(1),{
+            start={'9007199254740993','9007199254740992','9007199254740993'},
+            gate={1,2,3},key={64,65,67},velocity={9,100,127},channel={15,0,0}
+        })
+        tx:commit();return p:content_hash()
+    "#,
+    );
+    assert_eq!(row_hash, column_hash);
+    let row_commits = rows.take_commits().unwrap();
+    let column_commits = columns.take_commits().unwrap();
+    let records = |commits: &tx::Commits| {
+        commits
+            .result()
+            .track(0)
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.record())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(records(&row_commits), records(&column_commits));
+    let got = records(&column_commits);
+    assert_eq!(
+        got.iter().map(|r| r.attrs.pitch()).collect::<Vec<_>>(),
+        [65, 64, 67]
+    );
+    assert_eq!({ got[0].start_tick }, 9_007_199_254_740_992);
+    assert_eq!({ got[1].start_tick }, 9_007_199_254_740_993);
+    assert_eq!(got[0].attrs.velocity(), 100);
+    assert_eq!(got[0].sub, Default::default());
+    columns.set_world(Some(World::new(
+        Arc::clone(&doc),
+        history.incarnations().snapshot(),
+    )));
+    for (payload, words) in [
+        ("{start={0,1},gate={1},key={60,61}}", "needs a gate"),
+        (
+            "{start={0},gate={1},key={60},velocity={0}}",
+            "velocity is 1 - 127",
+        ),
+        ("{start={0},gate={1},key={200}}", "highest key"),
+        (
+            "{start={0},gate={1},key={60},subchannel={7}}",
+            "no subchannel",
+        ),
+    ] {
+        let error=columns.run("invalid-columns.lua",&format!("local p=plum.project.current();plum.transaction{{}}:insert_notes(p:track(1),{payload})")).unwrap_err();
+        assert!(error.message.contains(words), "{}", error.message);
+        assert!(columns.take_commits().is_none());
+        assert_eq!(doc.note_count(), 0);
+    }
+}
+
+#[test]
+fn column_insert_65536_notes_fits_eight_mib_vm_with_gc_stopped() {
+    let (mut doc, mut history) = project(0);
+    history.observe_ids(&doc);
+    let host = Host::new(
+        Limits {
+            memory: 8 * 1024 * 1024,
+            ..Limits::default()
+        },
+        EDIT,
+    )
+    .unwrap();
+    host.set_world(Some(World::new(
+        Arc::clone(&doc),
+        history.incarnations().snapshot(),
+    )));
+    host.lua.gc_stop();
+    let preview = run(
+        &host,
+        r#"
+        local p=plum.project.current();local track=p:track(1)
+        local starts,gates,keys={},{},{}
+        for n=1,65536 do starts[n]=n*2;gates[n]=1;keys[n]=60 end
+        local tx=plum.transaction{label='Column allocation fixture'}
+        assert(tx:insert_notes(track,{start=starts,gate=gates,key=keys})==65536)
+        tx:commit();return p:content_hash()
+    "#,
+    );
+    assert!(host.lua.used_memory() < 8 * 1024 * 1024);
+    let mut commits = host.take_commits().unwrap();
+    assert_eq!(commits.apply(&mut history, &mut doc).unwrap(), 1);
+    assert_eq!(doc.note_count(), 65536);
+    assert_eq!(hash(&doc), preview);
+    let notes = &doc.track(0).unwrap().notes;
+    let first = notes.iter().next().unwrap().record();
+    let last = notes.iter().last().unwrap().record();
+    assert_eq!((first.start_tick, last.start_tick), (2, 131072));
+    assert_eq!(first.attrs.velocity(), 100);
+    history
+        .undo(Arc::get_mut(&mut doc).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc.note_count(), 0);
+    history
+        .redo(Arc::get_mut(&mut doc).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hash(&doc), preview);
+}
+
+#[test]
 fn note_writes_need_the_notes_edit_capability() {
     let (doc, mut h) = project(4);
     h.observe_ids(&doc);

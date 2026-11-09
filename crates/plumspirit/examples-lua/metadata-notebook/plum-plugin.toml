@@ -1,0 +1,9 @@
+id = "plumspirit.example.metadata-notebook"
+name = "Metadata Notebook"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Author-owned typed project attributes, explicit schema migration and native Undo."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "metadata.edit"]

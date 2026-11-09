@@ -1,0 +1,9 @@
+id = "plumspirit.example.text-art-studio"
+name = "Text Art Studio"
+version = "0.4.0"
+api = "0.2"
+entry = "main.lua"
+description = "Author-written glyph artwork, explicit fallback, original color-layer laboratory and fixed captured Subchannel MIDI artwork; native Preview, presets and Undo."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["fonts.list", "notes.edit", "project.read", "ui.panels"]

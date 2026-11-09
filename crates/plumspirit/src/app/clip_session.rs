@@ -1486,3 +1486,67 @@ mod tests {
         assert!(h.app.clip_session().is_none());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn visible_ruler_seek_reveals_on_the_clip_axis() {
+    use crate::app::test_support::Harness;
+    use crate::piano_roll::RollAction;
+    use plumspirit_engine::editor::clips;
+    use plumspirit_engine::history::{History, HistoryLimits};
+    use plumspirit_engine::model::project::Bpm;
+    use plumspirit_engine::model::{NoteAttrs, NoteOffKind, NoteRecord};
+
+    let mut doc = PlumDocument::new_project("Seek".into(), Bpm::DEFAULT, 480);
+    doc.track_mut(0)
+        .unwrap()
+        .notes
+        .insert_sorted_batch(
+            &[NoteRecord::new(
+                0,
+                4_000,
+                NoteAttrs::new(60, 100, 0, 0, NoteOffKind::NoteOff).unwrap(),
+            )],
+            false,
+        )
+        .unwrap();
+    let track = doc.track(0).unwrap().id();
+    let op = clips::duplicate_clips(&doc, &[(ClipId::Primary(track), 0, 200_000)], true).unwrap();
+    History::new(HistoryLimits::default())
+        .apply(&mut doc, op)
+        .unwrap();
+    let id = doc.clips().layout().placements[0].id;
+    let mut h = Harness::new(doc);
+    assert!(h.app.open_clip_session(id));
+    h.app.main_view = super::track_list::MainView::PianoRoll;
+    for scale in [1.0, 1.5] {
+        h.app_frame(egui::vec2(1400.0, 900.0), scale);
+        h.app.roll.view.time.origin_tick = 100;
+        h.app.roll.view.time.pixels_per_tick = 0.5;
+        let before = h.app.roll.view.time;
+        let fingerprint = h.doc().state_fingerprint();
+        for (song, local) in [(200_400, 400), (200_240, 240), (200_900, 900)] {
+            assert_eq!(h.app.edit_shift(), 200_000);
+            assert_eq!(h.app.to_content(song), local);
+            let click_x = before.tick_to_x(local);
+            assert!((0.0..h.app.roll.view_width()).contains(&click_x));
+            h.app
+                .apply_roll_actions(vec![RollAction::Seek(song)], &h.ctx);
+            assert_eq!(h.app.transport.position(), song);
+            assert_eq!(h.app.roll.cursor_tick, song);
+            assert_eq!(
+                h.app.roll.view.time, before,
+                "in-view seek at song {song}, local {local}"
+            );
+            assert_eq!(
+                h.app.roll.view.time.tick_to_x(h.app.to_content(song)),
+                click_x
+            );
+            assert_eq!(h.doc().state_fingerprint(), fingerprint);
+        }
+        h.app.roll.view.time.origin_tick = 3_900;
+        h.app.reveal_playhead();
+        let x = h.app.roll.view.time.tick_to_x(900);
+        assert!((0.0..h.app.roll.view_width()).contains(&x));
+    }
+}

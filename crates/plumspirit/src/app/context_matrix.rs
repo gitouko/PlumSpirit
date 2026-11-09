@@ -2270,7 +2270,7 @@ fn clipboard_keys_act_on_the_selected_clips_in_the_track_list() {
             );
             h.shortcut_events(vec![egui::Event::Cut]);
             assert!(
-                h.status().contains("Delete acts on the clips"),
+                h.status().contains("Cut acts on the clips"),
                 "{c:?}: {}",
                 h.status()
             );

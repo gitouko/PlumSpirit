@@ -456,68 +456,65 @@ impl PlumSpiritApp {
         true
     }
 
-    /// Ctrl+C in a graph: copies its selected events. Returns true when it acted.
-    pub(super) fn copy_graph_selection(&mut self) -> bool {
+    /// Snapshot of the active graph selection. Saving an automation score
+    /// uses this without publishing anything to the clipboard.
+    pub(super) fn graph_selection_for_copy(&self) -> Option<(u64, EventClipboard)> {
         let slot = self.active_graph;
         let target = self.shown_target(slot);
         let channel = self.graph_slot(slot).channel;
         let view = &self.graphs.views[slot];
-        match target {
-            GraphTarget::MasterVolume => {
-                let ids = view.selected_master();
-                let Some(d) = self.doc() else {
-                    return false;
-                };
-                let mut pts: Vec<(u64, u16)> = d
-                    .conductor()
-                    .master_volume()
-                    .iter()
-                    .filter(|p| ids.contains(&p.id))
-                    .map(|p| (p.tick, p.value))
-                    .collect();
-                if pts.is_empty() {
-                    return false;
-                }
-                let t0 = pts[0].0;
-                for p in &mut pts {
-                    p.0 -= t0;
-                }
-                let n = pts.len();
-                self.event_clipboard = Some(EventClipboard::Master(pts));
-                self.set_status(
-                    format!("Copied {n} Master Volume point(s)."),
-                    StatusKind::Info,
-                );
-                true
+        let doc = self.doc()?;
+        if target == GraphTarget::MasterVolume {
+            let ids: std::collections::HashSet<_> = view.selected_master().into_iter().collect();
+            let mut points: Vec<_> = doc
+                .conductor()
+                .master_volume()
+                .iter()
+                .filter(|p| ids.contains(&p.id))
+                .map(|p| (p.tick, p.value))
+                .collect();
+            let first = points.first()?.0;
+            for (tick, _) in &mut points {
+                *tick -= first;
             }
-            t => {
-                let Some(kind) = graph_controller(t) else {
-                    return false;
-                };
-                let ids = view.selected_controllers();
-                if ids.is_empty() {
-                    return false;
-                }
-                let ti = self.edit_target();
-                let Some(track) = self
-                    .doc()
-                    .and_then(|d| plumspirit_engine::editor::note_view(d, ti).ok())
-                else {
-                    return false;
-                };
-                let clip = EventClip::copy(track, kind, channel, &ids);
-                if clip.is_empty() {
-                    return false;
-                }
-                let n = clip.points.len();
-                self.event_clipboard = Some(EventClipboard::Controller(clip));
-                self.set_status(
-                    format!("Copied {n} {} event(s).", kind.label()),
-                    StatusKind::Info,
-                );
-                true
-            }
+            return Some((first, EventClipboard::Master(points)));
         }
+        let kind = graph_controller(target)?;
+        let track = plumspirit_engine::editor::note_view(doc, self.edit_target()).ok()?;
+        let ids = view.selected_controllers();
+        let first = ids
+            .iter()
+            .filter_map(|&i| track.events().events().get(i))
+            .filter(|event| kind.value_of(event, channel).is_some())
+            .map(|event| event.tick)
+            .min()?;
+        let clip = EventClip::copy(track, kind, channel, &ids);
+        Some((self.to_song(first), EventClipboard::Controller(clip)))
+    }
+
+    pub(super) fn copy_graph_selection(&mut self, anchor: u64, clipboard: EventClipboard) -> bool {
+        use plumspirit_engine::editor::interchange::{Music, Origin};
+        let count = match &clipboard {
+            EventClipboard::Master(points) => points.len(),
+            EventClipboard::Controller(clip) => clip.points.len(),
+        };
+        if self.uses_system_clipboard() {
+            let origin = Origin::new(self.doc().expect("copied graph"), anchor);
+            let music = match clipboard {
+                EventClipboard::Master(points) => Music::Master(points),
+                EventClipboard::Controller(clip) => Music::Controller {
+                    clip,
+                    channel: self.graph_slot(self.active_graph).channel,
+                },
+            };
+            if !self.publish_music(origin, &music) {
+                return false;
+            }
+        } else {
+            self.event_clipboard = Some(clipboard);
+        }
+        self.set_status(format!("Copied {count} graph point(s)."), StatusKind::Info);
+        true
     }
 
     /// Ctrl+V in a graph: pastes copied events at the edit position onto the
@@ -527,6 +524,11 @@ impl PlumSpiritApp {
         let Some(clip) = self.event_clipboard.clone() else {
             return false;
         };
+        self.paste_graph_clip(clip);
+        true
+    }
+
+    pub(super) fn paste_graph_clip(&mut self, clip: EventClipboard) -> bool {
         let slot = self.active_graph;
         let target = self.shown_target(slot);
         let channel = self.graph_slot(slot).channel;

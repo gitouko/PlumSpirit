@@ -1223,6 +1223,8 @@ pub struct ProjectInfo {
     /// JSON text) sorted by id. Saved in `.lup` (`PLUG`); outside the undo
     /// history like Mute / Solo (it dirties the project); never exported.
     pub plugin_data: Vec<(String, String)>,
+    /// Sparse typed transactional API02 metadata, separate from legacy settings.
+    pub metadata: super::metadata::Metadata,
     pub unknown_sections: Vec<UnknownSection>,
     /// v1.0-Launch L-F08 (contract §016): Play Only Selected Tracks — a
     /// transient monitor set (track ids, sorted). While set, exactly these
@@ -1263,6 +1265,7 @@ impl Default for ProjectInfo {
             track_list: None,
             source: None,
             plugin_data: Vec::new(),
+            metadata: Default::default(),
             unknown_sections: Vec::new(),
             monitor: None,
         }

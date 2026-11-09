@@ -167,6 +167,11 @@ pub fn identity(doc: &PlumDocument) -> u64 {
     if doc.project().keys != KeyRange::Standard {
         h.bytes(b"keys256");
     }
+    // Preserve all legacy empty-store identities.
+    if !doc.project().metadata.is_empty() {
+        h.bytes(b"XMDA1");
+        h.bytes(&doc.project().metadata.encode().expect("validated metadata"));
+    }
     h.0 | 1
 }
 
@@ -677,6 +682,14 @@ fn encode_change_deferring(
             put_uvarint(o, v.len() as u64);
             for c in v {
                 encode_change_deferring(o, doc, c, defer.as_deref_mut())?;
+            }
+        }
+        Change::Metadata { old, new } => {
+            o.push(22);
+            for table in [old, new] {
+                let b = table.encode()?;
+                put_uvarint(o, b.len() as u64);
+                o.extend(b);
             }
         }
         Change::Groups { old, new } => {
@@ -1335,6 +1348,10 @@ fn get_change(d: &mut Dec<'_>, after: bool, depth: u32) -> R<Change> {
             }
             Change::Group(v)
         }
+        22 => Change::Metadata {
+            old: Box::new(crate::model::metadata::Metadata::decode(d.bytes()?)?),
+            new: Box::new(crate::model::metadata::Metadata::decode(d.bytes()?)?),
+        },
         16 => Change::Groups {
             old: Box::new(get_groups(d)?),
             new: Box::new(get_groups(d)?),
@@ -2768,6 +2785,44 @@ mod clip_record_tests {
                 let _ = crate::history::move_clips_for_test(&mut d, &mut c);
                 d.validate_clips().unwrap();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::model::metadata::{Metadata, Record, Value};
+    #[test]
+    fn typed_metadata_journal_patch_roundtrips_without_touching_legacy_identity() {
+        let mut d = PlumDocument::new_project("Metadata".into(), Bpm::DEFAULT, 960);
+        let before = identity(&d);
+        let old = Metadata::default();
+        let mut new = old.clone();
+        new.set(
+            "author.demo",
+            Some(Record {
+                version: 3,
+                value: Value::Integer(9_007_199_254_740_993),
+            }),
+        )
+        .unwrap();
+        d.project_mut().metadata = new.clone();
+        assert_ne!(identity(&d), before);
+        let change = Change::Metadata {
+            old: Box::new(old.clone()),
+            new: Box::new(new.clone()),
+        };
+        let mut bytes = Vec::new();
+        encode_change(&mut bytes, &d, &change).unwrap();
+        let mut restored = decode_change(&bytes, true).unwrap();
+        super::super::revert(&mut d, &mut restored).unwrap();
+        assert_eq!(d.project().metadata, old);
+        assert_eq!(identity(&d), before);
+        super::super::reapply(&mut d, &mut restored).unwrap();
+        assert_eq!(d.project().metadata, new);
+        for end in 0..bytes.len() {
+            assert!(decode_change(&bytes[..end], true).is_err());
         }
     }
 }

@@ -78,6 +78,8 @@
 //!   loop start and continues from there. The wrap is computed on the tick
 //!   timeline, so tempo ramps never drift across iterations.
 
+pub mod midi_plan;
+
 use crate::model::conductor::MASTER_VOLUME_MAX;
 use crate::model::correction::{Corrected, Correction};
 use crate::model::document::PlumDocument;

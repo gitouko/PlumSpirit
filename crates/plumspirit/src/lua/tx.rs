@@ -33,6 +33,21 @@ use super::handles::{
 };
 use super::{Capability, Category, Host, stop};
 
+#[path = "tx_note_input.rs"]
+mod note_input;
+
+#[path = "groups.rs"]
+pub(super) mod groups;
+
+#[path = "tx_writer.rs"]
+mod writer;
+
+#[path = "tx_image_mask.rs"]
+mod image_mask;
+
+#[path = "metadata.rs"]
+pub(super) mod metadata;
+
 /// Notes a transaction may remove before its commit needs the user's
 /// confirmation.
 pub const CONFIRM_REMOVED_NOTES: u64 = 1_000_000;
@@ -63,8 +78,82 @@ fn intern(label: &str) -> &'static str {
     s
 }
 
+/// The native quota remains held while Lua retains a transaction-born handle.
+pub(super) struct BirthFence {
+    live: Arc<super::reactive::Fence>,
+    run: u64,
+    applied: std::sync::atomic::AtomicBool,
+    _native: super::bridge::Reservation,
+}
+impl std::fmt::Debug for BirthFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BirthFence")
+            .field("active", &self.active())
+            .finish()
+    }
+}
+impl BirthFence {
+    pub(super) fn active(&self) -> bool {
+        self.live.active()
+    }
+    pub(super) fn valid_in(&self, run: u64) -> bool {
+        self.active()
+            && (self.run == run || self.applied.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+/// Cancellation, failed execution and refused/discarded Apply expire born handles.
+struct BirthGuard {
+    fence: Option<Arc<BirthFence>>,
+    accepted: bool,
+    run: u64,
+}
+impl BirthGuard {
+    fn new(run: u64) -> Self {
+        Self {
+            fence: None,
+            accepted: false,
+            run,
+        }
+    }
+    fn token(&mut self, lua: &Lua) -> mlua::Result<Arc<BirthFence>> {
+        if let Some(fence) = &self.fence {
+            return Ok(Arc::clone(fence));
+        }
+        let native = lua
+            .app_data_ref::<super::bridge::NativeBudget>()
+            .ok_or_else(|| runtime("Handle accounting unavailable."))?
+            .reserve(128)
+            .map_err(|e| e.lua())?;
+        let fence = Arc::new(BirthFence {
+            live: super::reactive::Fence::live(),
+            run: self.run,
+            applied: std::sync::atomic::AtomicBool::new(false),
+            _native: native,
+        });
+        self.fence = Some(Arc::clone(&fence));
+        Ok(fence)
+    }
+    fn accept(&mut self) {
+        self.accepted = true;
+        if let Some(f) = &self.fence {
+            f.applied.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+impl Drop for BirthGuard {
+    fn drop(&mut self) {
+        if !self.accepted
+            && let Some(f) = &self.fence
+        {
+            f.live.invalidate();
+        }
+    }
+}
+
 /// One committed transaction: an `Operation::Group` and what it does.
 pub struct CommitStep {
+    birth: BirthGuard,
+    birth_range: (u32, u32),
     pub label: &'static str,
     /// The transaction's edits (`None`: it changed only the selection).
     op: Option<Operation>,
@@ -77,6 +166,8 @@ pub struct CommitStep {
     pub removed_notes: u64,
     /// Notes the transaction creates (inserted, changed, duplicated).
     pub inserted_notes: u64,
+    writer_notes: u64,
+    native: Vec<super::bridge::Reservation>,
 }
 
 /// Why committed changes were not applied.
@@ -119,12 +210,40 @@ pub struct Commits {
     /// The project after every step (the last transaction's working copy).
     result: Arc<PlumDocument>,
     pub steps: Vec<CommitStep>,
+    _native: Vec<super::bridge::Reservation>,
+    format_review: Option<Box<super::format_review::Report>>,
 }
 
 impl Commits {
+    pub(crate) fn prepare_format_review(
+        &mut self,
+        budget: &super::bridge::NativeBudget,
+        check: impl FnMut() -> mlua::Result<()>,
+    ) -> mlua::Result<()> {
+        let source = self
+            .base
+            .as_deref()
+            .ok_or_else(|| runtime("The import review source expired."))?;
+        self.format_review = Some(Box::new(super::format_review::Report::prepare(
+            source,
+            &self.result,
+            budget,
+            check,
+        )?));
+        Ok(())
+    }
+    pub(crate) fn format_review(&self) -> Option<&super::format_review::Report> {
+        self.format_review.as_deref()
+    }
     /// The project as it is after every step (what a preview draws).
     pub fn result(&self) -> &PlumDocument {
         &self.result
+    }
+    /// Native review checks freshness without consuming the staged transaction.
+    pub(crate) fn source_matches(&self, doc: &Arc<PlumDocument>) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(base, doc))
     }
 
     /// A step removes so many notes that the user must confirm first.
@@ -132,6 +251,24 @@ impl Commits {
         self.steps
             .iter()
             .any(|s| s.removed_notes >= CONFIRM_REMOVED_NOTES)
+    }
+
+    /// Called only after the native response source guard validates the live
+    /// document. Ordinary API01 pointer-equality semantics remain unchanged.
+    pub(crate) fn bind_response_base(
+        &mut self,
+        doc: &Arc<PlumDocument>,
+    ) -> Result<(), CommitError> {
+        if self.steps.len() != 1
+            || self.steps[0].op.is_none()
+            || !self.steps[0].selections.is_empty()
+            || self.steps[0].removed_notes > super::response::MAX_NOTES
+            || self.steps[0].inserted_notes > super::response::MAX_NOTES
+        {
+            return Err(CommitError::Refused {step:0,message:"An automatic response needs exactly one bounded musical transaction and no explicit selection changes.".into()});
+        }
+        self.base = Some(Arc::clone(doc));
+        Ok(())
     }
 
     /// Notes all steps remove.
@@ -162,7 +299,7 @@ impl Commits {
         };
         let steps = std::mem::take(&mut self.steps);
         let mut applied = 0;
-        for s in steps {
+        for mut s in steps {
             let label = s.label;
             if let Some(op) = s.op
                 && let Err(e) = history.apply(d, op)
@@ -196,6 +333,7 @@ impl Commits {
                     });
                 }
             }
+            s.birth.accept();
             applied += 1;
         }
         Ok(applied)
@@ -210,20 +348,31 @@ impl Commits {
         history: &mut History,
         doc: &mut Arc<PlumDocument>,
     ) -> Result<(), CommitError> {
-        let Commits { base, result, .. } = self;
+        let Commits {
+            base,
+            result,
+            mut steps,
+            ..
+        } = self;
         drop(base);
         let new = Arc::try_unwrap(result).unwrap_or_else(|shared| (*shared).clone());
         let Some(d) = Arc::get_mut(doc) else {
             return Err(CommitError::Busy);
         };
         history.replace_without_undo(d, new);
+        for s in &mut steps {
+            s.birth.accept();
+        }
         Ok(())
     }
 }
 
 /// An open transaction.
 struct OpenTx {
+    birth: BirthGuard,
+    track_origin_floor: u32,
     serial: u64,
+    group_origin_floor: u32,
     label: &'static str,
     work: Arc<PlumDocument>,
     ids: Incarnations,
@@ -233,6 +382,9 @@ struct OpenTx {
     inserted_notes: u64,
     /// Hosts whose note selection the script set.
     selection_hosts: Vec<NoteHost>,
+    writers: Vec<writer::Entry>,
+    writer_notes: u64,
+    native: Vec<super::bridge::Reservation>,
 }
 
 /// Transaction state of one Lua state (app data).
@@ -243,9 +395,34 @@ pub(super) struct TxSlot {
     run_world: Option<World>,
     commits: Vec<CommitStep>,
     next_serial: u64,
+    writer_accepted: u64,
+    group_edits: usize,
+    metadata_edits: usize,
+    run_serial: u64,
 }
 
 impl TxSlot {
+    pub(super) fn track_birth(
+        &mut self,
+        lua: &Lua,
+        id: TrackId,
+    ) -> mlua::Result<Option<Arc<BirthFence>>> {
+        if let Some(tx) = self.open.as_mut()
+            && id.0 >= tx.track_origin_floor
+            && id.0 < tx.work.next_track_id()
+        {
+            return tx.birth.token(lua).map(Some);
+        }
+        match self
+            .commits
+            .iter_mut()
+            .rev()
+            .find(|s| id.0 >= s.birth_range.0 && id.0 < s.birth_range.1)
+        {
+            Some(s) => s.birth.token(lua).map(Some),
+            None => Ok(None),
+        }
+    }
     /// The world reads see while a transaction is open: its working copy.
     pub(super) fn world(&self, base: Option<&World>) -> Option<World> {
         let tx = self.open.as_ref()?;
@@ -254,24 +431,39 @@ impl TxSlot {
             doc: Arc::clone(&tx.work),
             ids: tx.ids.snapshot(),
             info,
+            run: self.run_serial,
+            group_scope: tx.serial,
+            group_origin_floor: tx.group_origin_floor,
         })
     }
 }
 
 /// Called by [`Host::run`] before a run: forgets an earlier run's state.
 pub(super) fn begin_run(lua: &Lua) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+    let serial = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
     let world = lua.app_data_ref::<WorldSlot>().and_then(|s| s.0.clone());
     if let Some(mut slot) = lua.app_data_mut::<TxSlot>() {
         slot.open = None;
         slot.commits.clear();
+        slot.writer_accepted = 0;
+        slot.group_edits = 0;
+        slot.metadata_edits = 0;
         slot.run_world = world;
+        slot.run_serial = serial;
+    }
+    if let Some(mut slot) = lua.app_data_mut::<WorldSlot>()
+        && let Some(w) = slot.0.as_mut()
+    {
+        w.run = serial;
     }
 }
 
 /// Called by [`Host::run`] after a run: a failed run keeps nothing; an open
 /// transaction is canceled; the world goes back to what the run read.
 pub(super) fn end_run(lua: &Lua, ok: bool) -> Option<Commits> {
-    let (world, commits) = {
+    let (world, mut commits) = {
         let mut slot = lua.app_data_mut::<TxSlot>()?;
         slot.open = None;
         let commits = std::mem::take(&mut slot.commits);
@@ -287,10 +479,16 @@ pub(super) fn end_run(lua: &Lua, ok: bool) -> Option<Commits> {
         return None;
     }
     let result = result?;
+    let native = commits
+        .iter_mut()
+        .flat_map(|c| std::mem::take(&mut c.native))
+        .collect();
     world.map(|w| Commits {
         base: Some(w.doc),
         result,
         steps: commits,
+        _native: native,
+        format_review: None,
     })
 }
 
@@ -299,6 +497,24 @@ fn runtime(msg: impl Into<String>) -> mlua::Error {
 }
 
 fn require(lua: &Lua, cap: Capability) -> mlua::Result<()> {
+    super::formats::check_write(lua)?;
+    super::reactive::check_transaction_write(lua)?;
+    if matches!(cap, Capability::EditTracks | Capability::EditConductor) {
+        super::response::explicit_only(lua, "Structural and Conductor edits")?;
+    }
+    if super::reactive::responding(lua)
+        && cap != Capability::ReadProject
+        && lua
+            .app_data_ref::<TxSlot>()
+            .and_then(|s| s.open.as_ref().map(|t| t.ops.len()))
+            .is_some_and(|n| n >= super::response::MAX_OPERATIONS)
+    {
+        return Err(stop(
+            Category::Budget,
+            "An automatic response supports at most eight batched native editing operations.",
+        ));
+    }
+
     let granted = lua
         .app_data_ref::<super::handles::Granted>()
         .map(|g| Arc::clone(&g.0))
@@ -354,53 +570,109 @@ fn channel_arg(v: Option<i64>) -> mlua::Result<Option<u8>> {
     }
 }
 
+pub(crate) fn has_pending_work(lua: &Lua) -> bool {
+    lua.app_data_ref::<TxSlot>()
+        .is_some_and(|s| s.open.is_some() || !s.commits.is_empty())
+}
+
 /// Installs `plum.transaction`.
 pub fn install(lua: &Lua, plum: &Table) -> mlua::Result<()> {
-    plum.set(
-        "transaction",
-        lua.create_function(|lua, opts: Option<Table>| {
-            let label = match &opts {
-                Some(t) => t.get::<Option<String>>("label")?,
-                None => None,
-            };
-            let base = super::handles::current_world(lua)
-                .ok_or_else(|| runtime("No project is open, so there is nothing to change."))?;
-            let mut slot = lua
-                .app_data_mut::<TxSlot>()
-                .ok_or_else(|| runtime("Transactions are not available here."))?;
-            if slot.open.is_some() {
-                return Err(runtime(
-                    "A transaction is already open; commit or cancel it first.",
-                ));
-            }
-            slot.next_serial += 1;
-            let serial = slot.next_serial;
-            let work = Arc::new((*base.doc).clone());
-            let ids = Incarnations::resume(&base.ids, &work);
-            slot.open = Some(OpenTx {
-                serial,
-                label: intern(label.as_deref().unwrap_or("")),
-                work,
-                ids,
-                // The working copy keeps no undo (cleared after every write),
-                // so no edit is refused for the undo memory here; the
-                // project's own history decides at the commit.
-                history: History::new(HistoryLimits {
-                    max_bytes: usize::MAX / 4,
-                    max_entries: 2_000,
-                }),
-                ops: Vec::new(),
-                removed_notes: 0,
-                inserted_notes: 0,
-                selection_hosts: Vec::new(),
-            });
-            Ok(LuaTx(serial))
-        })?,
-    )
+    writer::install_limits(lua, plum)?;
+    metadata::install(lua, plum)?;
+    let open = lua.create_function(|lua, opts: Option<Table>| {
+        super::formats::check_open(lua)?;
+        super::reactive::check_transaction_write(lua)?;
+        super::playback::loop_intent::check_transaction(lua)?;
+        super::playback::midi::check_transaction(lua)?;
+        let label = match &opts {
+            Some(t) => t.get::<Option<String>>("label")?,
+            None => None,
+        };
+        let base = super::handles::current_world(lua)
+            .ok_or_else(|| runtime("No project is open, so there is nothing to change."))?;
+        let metadata_native = if !base.doc.project().metadata.is_empty() {
+            Some(
+                lua.app_data_ref::<super::bridge::NativeBudget>()
+                    .ok_or_else(|| runtime("Metadata accounting unavailable."))?
+                    .reserve(
+                        base.doc
+                            .project()
+                            .metadata
+                            .heap_bytes()
+                            .saturating_mul(2)
+                            .saturating_add(4096),
+                    )
+                    .map_err(|e| e.lua())?,
+            )
+        } else {
+            None
+        };
+        let mut slot = lua
+            .app_data_mut::<TxSlot>()
+            .ok_or_else(|| runtime("Transactions are not available here."))?;
+        if super::reactive::responding(lua) && !slot.commits.is_empty() {
+            return Err(stop(
+                Category::Budget,
+                "An automatic response may commit only one transaction.",
+            ));
+        }
+        if slot.open.is_some() {
+            return Err(runtime(
+                "A transaction is already open; commit or cancel it first.",
+            ));
+        }
+        slot.next_serial += 1;
+        let serial = slot.next_serial;
+        let work = Arc::new((*base.doc).clone());
+        let ids = Incarnations::resume(&base.ids, &work);
+        slot.open = Some(OpenTx {
+            birth: BirthGuard::new(slot.run_serial),
+            track_origin_floor: base.doc.next_track_id(),
+            serial,
+            group_origin_floor: if base.group_scope != 0 {
+                base.group_origin_floor
+            } else {
+                base.doc.project().groups.next_id()
+            },
+            label: intern(label.as_deref().unwrap_or("")),
+            work,
+            ids,
+            // The working copy keeps no undo (cleared after every write),
+            // so no edit is refused for the undo memory here; the
+            // project's own history decides at the commit.
+            history: History::new(HistoryLimits {
+                max_bytes: usize::MAX / 4,
+                max_entries: 2_000,
+            }),
+            ops: Vec::new(),
+            removed_notes: 0,
+            inserted_notes: 0,
+            selection_hosts: Vec::new(),
+            writers: Vec::new(),
+            writer_notes: 0,
+            native: metadata_native.into_iter().collect(),
+        });
+        Ok(LuaTx(serial))
+    })?;
+    lua.set_named_registry_value("plumspirit.native.transaction", open.clone())?;
+    plum.set("transaction", open)
+}
+
+pub(super) fn open_owned(lua: &Lua, label: &str) -> mlua::Result<AnyUserData> {
+    let open: mlua::Function = lua.named_registry_value("plumspirit.native.transaction")?;
+    let opts = lua.create_table()?;
+    opts.raw_set("label", label)?;
+    open.call(opts)
 }
 
 /// What a write asks for, with the objects already resolved to ids.
 pub(super) enum Step {
+    SetMetadata {
+        table: Box<plumspirit_engine::model::metadata::Metadata>,
+    },
+    SetGroups {
+        table: Box<plumspirit_engine::model::GroupTable>,
+    },
     AddTrack {
         after: Option<TrackId>,
     },
@@ -501,15 +773,17 @@ impl Step {
     /// The capability the step needs.
     fn capability(&self) -> Capability {
         match self {
+            Step::SetMetadata { .. } => Capability::EditMetadata,
             Step::SetTempo { .. }
             | Step::RemoveTempo { .. }
             | Step::SetSignature { .. }
             | Step::RemoveSignature { .. }
             | Step::AddMarker { .. }
             | Step::RemoveMarkers { .. } => Capability::EditConductor,
-            Step::EraseNotes { .. } | Step::InsertNotes { .. } | Step::ReplaceEvents { .. } => {
-                Capability::EditNotes
-            }
+            Step::SetGroups { .. }
+            | Step::EraseNotes { .. }
+            | Step::InsertNotes { .. }
+            | Step::ReplaceEvents { .. } => Capability::EditNotes,
             _ => Capability::EditTracks,
         }
     }
@@ -528,6 +802,14 @@ fn indices(doc: &PlumDocument, ids: &[TrackId]) -> Result<Vec<usize>, String> {
 /// document gives the same operation).
 fn build(step: &Step, doc: &PlumDocument) -> Result<Operation, String> {
     Ok(match step {
+        Step::SetMetadata { table } => Operation::SetMetadata {
+            table: table.clone(),
+            label: "Edit Plugin Metadata",
+        },
+        Step::SetGroups { table } => Operation::SetGroups {
+            table: table.clone(),
+            label: "Edit Note Groups",
+        },
         Step::Clips(c) => super::clips::build(c, doc)?,
         Step::AddTrack { after: None } => Operation::AddTrack,
         Step::AddTrack { after: Some(t) } => folders::plan_add_track_below(doc, index(doc, *t)?)?,
@@ -685,6 +967,9 @@ fn build(step: &Step, doc: &PlumDocument) -> Result<Operation, String> {
 /// Applies `step` to transaction `serial`'s working copy and records it.
 pub(super) fn apply(lua: &Lua, serial: u64, step: Step, removed_notes: u64) -> mlua::Result<()> {
     require(lua, step.capability())?;
+    if matches!(&step, Step::ReplaceEvents { .. }) {
+        super::response::explicit_only(lua, "Controller event edits")?;
+    }
     let inserted = match &step {
         Step::InsertNotes { records, .. } => records.len() as u64,
         _ => 0,
@@ -699,6 +984,27 @@ pub(super) fn apply(lua: &Lua, serial: u64, step: Step, removed_notes: u64) -> m
                 "This transaction is closed (committed or canceled); open a new one.",
             ));
         }
+    };
+    super::response::check_removed(lua, tx.removed_notes, removed_notes)?;
+    groups::check_step(lua, &tx.work, &step)?;
+    let _metadata_temporary = if matches!(&step, Step::DeleteTrack { .. } | Step::SetGroups { .. })
+        && !tx.work.project().metadata.is_empty()
+    {
+        Some(
+            lua.app_data_ref::<super::bridge::NativeBudget>()
+                .ok_or_else(|| runtime("Metadata accounting unavailable."))?
+                .reserve(
+                    tx.work
+                        .project()
+                        .metadata
+                        .heap_bytes()
+                        .saturating_mul(4)
+                        .saturating_add(65536),
+                )
+                .map_err(|e| e.lua())?,
+        )
+    } else {
+        None
     };
     let (for_work, for_commit) = {
         let doc = &*tx.work;
@@ -755,7 +1061,7 @@ pub(super) fn handle_arg(v: &Value, what: &str) -> mlua::Result<Handle> {
     match v {
         Value::UserData(ud) => ud
             .borrow::<LuaHandle>()
-            .map(|h| h.0)
+            .map(|h| h.0.clone())
             .map_err(|_| runtime(format!("{what} must be a handle."))),
         other => Err(runtime(format!(
             "{what} must be a handle, not {}.",
@@ -793,6 +1099,7 @@ struct Changes {
     subchannel: Option<SubchannelId>,
     /// What happens to a note pushed outside the keys or before tick 0.
     outside: Outside,
+    metadata: note_input::Metadata,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -860,6 +1167,7 @@ impl Changes {
             channel: channel_arg(int("channel")?)?,
             subchannel,
             outside,
+            metadata: note_input::Metadata::parse(&note_input::Input::Row(t))?,
         })
     }
 
@@ -881,18 +1189,22 @@ impl Changes {
             u64::try_from(start).map_err(|_| "a note would move past the last tick".to_owned())?
         };
         // Gate: set, scale, add (in that order), never negative.
-        let mut gate = self.gate.unwrap_or(r.duration_ticks) as f64;
-        if let Some(f) = self.gate_scale {
-            gate = (gate * f).round();
-        }
-        let gate = (gate as i128 + i128::from(self.gate_add)).max(0);
+        let exact_gate = self.gate.unwrap_or(r.duration_ticks);
+        let gate = match self.gate_scale {
+            Some(f) => (exact_gate as f64 * f).round() as i128,
+            None => i128::from(exact_gate),
+        };
+        let gate = gate
+            .checked_add(i128::from(self.gate_add))
+            .ok_or_else(|| "a gate is too long".to_owned())?
+            .max(0);
         out.duration_ticks = u64::try_from(gate).map_err(|_| "a gate is too long".to_owned())?;
         if out.start_tick.checked_add(out.duration_ticks).is_none() {
             return Err("a note would end past the last tick".into());
         }
         // Key.
-        let key = i32::from(r.attrs.pitch()) + self.transpose;
-        let key = if key < 0 || key > i32::from(max_key) {
+        let key = i64::from(r.attrs.pitch()) + i64::from(self.transpose);
+        let key = if key < 0 || key > i64::from(max_key) {
             match self.outside {
                 Outside::Error => {
                     return Err(format!(
@@ -901,7 +1213,7 @@ impl Changes {
                         self.transpose
                     ));
                 }
-                Outside::Clamp => key.clamp(0, i32::from(max_key)),
+                Outside::Clamp => key.clamp(0, i64::from(max_key)),
                 Outside::Drop => return Ok(None),
             }
         } else {
@@ -916,7 +1228,7 @@ impl Changes {
         if let Some(f) = self.velocity_scale {
             v = (v * f).round();
         }
-        let v = (v as i64 + i64::from(self.velocity_add)).clamp(1, 127) as u8;
+        let v = (i128::from(v as i64) + i128::from(self.velocity_add)).clamp(1, 127) as u8;
         attrs = attrs.with_velocity(v).map_err(|e| e.to_string())?;
         if let Some(c) = self.channel {
             attrs = attrs.with_channel(c).map_err(|e| e.to_string())?;
@@ -925,7 +1237,10 @@ impl Changes {
         if let Some(s) = self.subchannel {
             out.sub = s;
         }
-        Ok(Some(out))
+        self.metadata
+            .apply(out)
+            .map(Some)
+            .map_err(|e| super::error_text(&e))
     }
 }
 
@@ -935,13 +1250,16 @@ fn record_from_table(
     base: Option<&NoteRecord>,
     default_channel: u8,
 ) -> mlua::Result<NoteRecord> {
-    let tick = |k: &str| -> mlua::Result<Option<u64>> {
-        match t.get::<Value>(k)? {
-            Value::Nil => Ok(None),
-            v => super::ticks::from_lua(&v, k).map(Some),
-        }
-    };
-    let int = |k: &str| t.get::<Option<i64>>(k);
+    record_from_input(note_input::Input::Row(t), base, default_channel)
+}
+
+fn record_from_input(
+    input: note_input::Input<'_>,
+    base: Option<&NoteRecord>,
+    default_channel: u8,
+) -> mlua::Result<NoteRecord> {
+    let tick = |k: &str| input.tick(k);
+    let int = |k: &str| input.integer(k);
     let start = tick("start")?
         .or(base.map(|b| b.start_tick))
         .ok_or_else(|| runtime("A note needs a start tick."))?;
@@ -979,13 +1297,26 @@ fn record_from_table(
     if start.checked_add(gate).is_none() {
         return Err(runtime("That note would end past the last tick."));
     }
-    Ok(NoteRecord {
+    note_input::Metadata::parse(&input)?.apply(NoteRecord {
         start_tick: start,
         duration_ticks: gate,
         attrs,
         sub,
         group: base.map(|b| b.group).unwrap_or(0),
     })
+}
+
+fn validate_group(doc: &PlumDocument, id: u32) -> mlua::Result<()> {
+    let groups = &doc.project().groups;
+    if id != 0 && groups.get(id).is_none() {
+        return Err(runtime("The note group does not exist."));
+    }
+    if groups.locked(id) {
+        return Err(runtime(
+            "The note group or an ancestor is locked; unlock it explicitly first.",
+        ));
+    }
+    Ok(())
 }
 
 /// Checks keys and subchannels of new notes against the project and the
@@ -1002,6 +1333,10 @@ fn finish_records(
             .track_by_id(host.track)
             .ok_or_else(|| runtime("That track no longer exists."))?;
         for (i, r) in records.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                check_budget(lua)?;
+            }
+            validate_group(&w.doc, r.group)?;
             if r.attrs.pitch() > max_key {
                 return Err(runtime(format!(
                     "Note {}: key {} is above this project's highest key ({max_key}); turn on 256-Key Mode first.",
@@ -1026,8 +1361,16 @@ fn finish_records(
 /// Notes the run's transactions created so far (open + committed).
 fn output_so_far(lua: &Lua) -> u64 {
     lua.app_data_ref::<TxSlot>().map_or(0, |s| {
-        s.open.as_ref().map_or(0, |t| t.inserted_notes)
-            + s.commits.iter().map(|c| c.inserted_notes).sum::<u64>()
+        s.open
+            .as_ref()
+            .map_or(0, |t| t.inserted_notes.saturating_sub(t.writer_notes))
+            .saturating_add(
+                s.commits
+                    .iter()
+                    .map(|c| c.inserted_notes.saturating_sub(c.writer_notes))
+                    .sum::<u64>(),
+            )
+            .saturating_add(s.writer_accepted)
     })
 }
 
@@ -1055,6 +1398,27 @@ fn erase(
     if hits.is_empty() {
         return Ok(());
     }
+    read(lua, |w| {
+        let store = host
+            .notes(&w.doc)
+            .ok_or_else(|| runtime("The note target no longer exists."))?;
+        let mut expected = hits.iter();
+        store.try_visit_ranks(
+            hits.iter().map(|h| h.rank),
+            || check_budget(lua),
+            |_, note| {
+                let hit = expected.next().expect("one visit per requested rank");
+                let note = note.ok_or_else(|| runtime("The notes changed during the callback."))?;
+                if note.record() != hit.rec {
+                    return Err(runtime(
+                        "The notes changed during the callback; read the query again.",
+                    ));
+                }
+                validate_group(&w.doc, note.group)
+            },
+        )?;
+        Ok(())
+    })?;
     let mut b = RankSetBuilder::default();
     for h in hits {
         b.push(h.rank);
@@ -1143,6 +1507,10 @@ pub struct LuaTx(pub(super) u64);
 
 impl UserData for LuaTx {
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        writer::add_methods(m);
+        image_mask::add_methods(m);
+        groups::add_tx_methods(m);
+        metadata::add_tx_methods(m);
         super::clips::add_tx_methods(m);
         m.add_method("add_track", |lua, this, opts: Option<Table>| {
             let (after, folder, name) = match &opts {
@@ -1193,6 +1561,14 @@ impl UserData for LuaTx {
         );
         m.add_method("delete_tracks", |lua, this, tracks: Value| {
             let ids = track_ids(lua, &tracks, "Each track")?;
+            // A mixed request must not delete an earlier unlocked subtree before
+            // discovering a locked later one that the author catches in pcall.
+            read(lua, |w| {
+                for &id in &ids {
+                    groups::check_step(lua, &w.doc, &Step::DeleteTrack { id })?;
+                }
+                Ok(())
+            })?;
             for id in ids {
                 // A track inside an already deleted subtree is gone: skip it.
                 let notes = read(lua, |w| {
@@ -1491,6 +1867,8 @@ impl UserData for LuaTx {
             if changed == 0 && deleted == 0 {
                 return Ok(0);
             }
+            let already=lua.app_data_ref::<TxSlot>().and_then(|s|s.open.as_ref().map(|t|t.removed_notes)).unwrap_or(0);
+            super::response::check_removed(lua,already,deleted)?;
             let out = finish_records(lua, host, out)?;
             erase(lua, this.0, host, &hits, false)?;
             if !out.is_empty() {
@@ -1509,6 +1887,15 @@ impl UserData for LuaTx {
             |lua, this, (q, how): (Value, Option<Table>)| {
                 let q = query_arg(&q)?;
                 let (host, hits) = evaluate(lua, &q)?;
+                read(lua, |w| {
+                    for (i, hit) in hits.iter().enumerate() {
+                        if i.is_multiple_of(4096) {
+                            check_budget(lua)?;
+                        }
+                        validate_group(&w.doc, hit.rec.group)?;
+                    }
+                    Ok(())
+                })?;
                 let c = match &how {
                     Some(t) => Changes::from_lua(t)?,
                     None => Changes::default(),
@@ -1559,34 +1946,19 @@ impl UserData for LuaTx {
                 if let Value::Table(starts) = notes.get::<Value>("start")? {
                     // Struct of arrays: start / gate / key (/ velocity / channel / subchannel).
                     let n = starts.raw_len();
-                    let col = |k: &str| notes.get::<Option<Table>>(k);
-                    let (gates, keys, vels, chans, subs) = (
-                        col("gate")?,
-                        col("key")?,
-                        col("velocity")?,
-                        col("channel")?,
-                        col("subchannel")?,
-                    );
+                    let columns = note_input::Columns::new(&notes, starts)?;
                     for i in 1..=n {
                         if i % super::notes::CHECK_NOTES == 0 {
                             check_budget(lua)?;
                         }
-                        let t = lua.create_table()?;
-                        t.set("start", starts.raw_get::<Value>(i)?)?;
-                        for (k, c) in [
-                            ("gate", &gates),
-                            ("key", &keys),
-                            ("velocity", &vels),
-                            ("channel", &chans),
-                            ("subchannel", &subs),
-                        ] {
-                            if let Some(c) = c {
-                                t.set(k, c.raw_get::<Value>(i)?)?;
-                            }
-                        }
-                        out.push(record_from_table(&t, None, default_channel).map_err(|e| {
-                            runtime(format!("Note {i}: {}", super::error_text(&e)))
-                        })?);
+                        out.push(
+                            record_from_input(
+                                note_input::Input::Column(&columns, i),
+                                None,
+                                default_channel,
+                            )
+                            .map_err(|e| runtime(format!("Note {i}: {}", super::error_text(&e))))?,
+                        );
                     }
                 } else {
                     for (i, v) in notes.sequence_values::<Table>().enumerate() {
@@ -1610,6 +1982,7 @@ impl UserData for LuaTx {
         m.add_method(
             "insert_events",
             |lua, this, (target, list): (Value, Table)| {
+                super::response::explicit_only(lua, "Controller/selection changes")?;
                 let h = handle_arg(&target, "The track")?;
                 let host = super::notes::host_of(lua, &h)?;
                 let default_channel = read(lua, |w| {
@@ -1644,6 +2017,7 @@ impl UserData for LuaTx {
             },
         );
         m.add_method("delete_events", |lua, this, q: Value| {
+            super::response::explicit_only(lua, "Controller/selection changes")?;
             let q = event_query_arg(&q)?;
             let (host, idx) = super::events::evaluate(lua, &q)?;
             channel_only(lua, host, &idx)?;
@@ -1663,6 +2037,7 @@ impl UserData for LuaTx {
             Ok(n)
         });
         m.add_method("modify_events", |lua, this, (q, how): (Value, Value)| {
+            super::response::explicit_only(lua,"Controller/selection changes")?;
             let q = event_query_arg(&q)?;
             let (host, idx) = super::events::evaluate(lua, &q)?;
             channel_only(lua, host, &idx)?;
@@ -1757,6 +2132,7 @@ impl UserData for LuaTx {
         m.add_method(
             "select_notes",
             |lua, this, (q, mode): (Value, Option<String>)| {
+                super::response::explicit_only(lua,"Controller/selection changes")?;
                 let q = query_arg(&q)?;
                 let (host, hits) = evaluate(lua, &q)?;
                 let mode = mode.unwrap_or_else(|| "replace".into());
@@ -1796,6 +2172,7 @@ impl UserData for LuaTx {
             },
         );
         m.add_method("clear_selection", |lua, this, target: Value| {
+            super::response::explicit_only(lua, "Controller/selection changes")?;
             let h = handle_arg(&target, "The track")?;
             let host = super::notes::host_of(lua, &h)?;
             set_selection(lua, this.0, host, &[])
@@ -1811,6 +2188,7 @@ impl UserData for LuaTx {
                 .ok_or_else(|| runtime("This transaction is closed."))?;
             let t = lua.create_table()?;
             t.set("operations", tx.ops.len() as i64)?;
+            t.set("staged_notes", writer::staged_notes(tx))?;
             t.set(
                 "removed_notes",
                 i64::try_from(tx.removed_notes).unwrap_or(i64::MAX),
@@ -1841,10 +2219,20 @@ impl UserData for LuaTx {
         });
         m.add_function("commit", |lua, ud: AnyUserData| {
             let serial = ud.borrow::<LuaTx>()?.0;
-            let (world_doc, ids) = {
+            let (world_doc, ids, group_origin_floor) = {
                 let mut slot = lua
                     .app_data_mut::<TxSlot>()
                     .ok_or_else(|| runtime("Transactions are not available here."))?;
+                if let Some(tx) = slot.open.as_ref().filter(|tx| tx.serial == serial) {
+                    writer::check_commit(tx)?;
+                    super::response::check_removed(lua, 0, tx.removed_notes)?;
+                    if super::reactive::responding(lua) && !tx.selection_hosts.is_empty() {
+                        return Err(stop(
+                            Category::Capability,
+                            "Automatic responses cannot commit explicit selection changes.",
+                        ));
+                    }
+                }
                 let tx = match slot.open.take() {
                     Some(tx) if tx.serial == serial => tx,
                     other => {
@@ -1855,13 +2243,18 @@ impl UserData for LuaTx {
                     }
                 };
                 let OpenTx {
+                    birth,
+                    track_origin_floor,
                     label,
+                    group_origin_floor,
                     work,
                     ids,
                     ops,
                     removed_notes,
                     inserted_notes,
                     selection_hosts,
+                    writer_notes,
+                    native,
                     ..
                 } = tx;
                 let selections: Vec<(NoteHost, RankSet)> = selection_hosts
@@ -1870,15 +2263,19 @@ impl UserData for LuaTx {
                     .collect();
                 if !ops.is_empty() || !selections.is_empty() {
                     slot.commits.push(CommitStep {
+                        birth,
+                        birth_range: (track_origin_floor, work.next_track_id()),
                         label,
                         operations: ops.len(),
                         op: (!ops.is_empty()).then_some(Operation::Group { ops, label }),
                         selections,
                         removed_notes,
                         inserted_notes,
+                        writer_notes,
+                        native,
                     });
                 }
-                (work, ids)
+                (work, ids, group_origin_floor)
             };
             // Later reads in this run see the committed state.
             if let Some(mut w) = lua.app_data_mut::<WorldSlot>()
@@ -1886,6 +2283,8 @@ impl UserData for LuaTx {
             {
                 base.doc = world_doc;
                 base.ids = ids.snapshot();
+                base.group_scope = serial;
+                base.group_origin_floor = group_origin_floor;
             }
             Ok(true)
         });

@@ -11,7 +11,7 @@
 //! Spiderweb share codes both ways.
 
 mod canvas;
-mod fonts;
+pub(crate) mod fonts;
 mod props;
 
 use super::paste_ui::{self, PasteOptions};

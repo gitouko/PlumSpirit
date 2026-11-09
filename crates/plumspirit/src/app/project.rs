@@ -138,7 +138,9 @@ impl PlumSpiritApp {
         self.display_tempo = None;
         self.last_export = None;
         self.scripts.cancel_all();
+        let stamp = self.lua_observation_stamp();
         if let Some(m) = self.lua_plugins.as_mut() {
+            m.observation_context(stamp);
             m.project_closed();
         }
         self.lua_plugins_generation = None;
@@ -952,6 +954,10 @@ impl PlumSpiritApp {
                 );
                 // v0.9 (V09-S18, `docs/INSPECTOR.md` I7).
                 self.inspector_saved();
+                self.publish_lua_observation(
+                    crate::lua::reactive::Kind::Saved,
+                    crate::lua::reactive::Data::Saved { midi: false },
+                );
                 self.continue_with(then, frame, ctx);
                 if self.close_after_job {
                     self.close_after_job = false;
@@ -1192,6 +1198,10 @@ impl PlumSpiritApp {
                 return;
             }
         };
+        self.publish_lua_observation(
+            crate::lua::reactive::Kind::Saved,
+            crate::lua::reactive::Data::Saved { midi: true },
+        );
         self.last_export = Some(path.clone());
         let name = files::display_name(&path);
         log::info!(
@@ -1270,6 +1280,10 @@ impl PlumSpiritApp {
                 return;
             }
         };
+        self.publish_lua_observation(
+            crate::lua::reactive::Kind::Saved,
+            crate::lua::reactive::Data::Saved { midi: true },
+        );
         self.last_export = Some(path.clone());
         let name = files::display_name(&path);
         log::info!(
@@ -1354,7 +1368,15 @@ impl PlumSpiritApp {
             self.show_memory_stop(&name, free, floor, job.total);
             return;
         }
+        let cancelled = job.cancelled();
         match (job.kind, output) {
+            (JobKind::Clipboard { generation, .. }, JobOutput::Clipboard(result)) => {
+                if cancelled {
+                    self.set_status("Clipboard operation canceled.", StatusKind::Info);
+                } else if generation == self.doc_generation() {
+                    self.finish_clipboard(result, job.started);
+                }
+            }
             (JobKind::ImportInto { path, dest, .. }, JobOutput::Import(r)) => {
                 self.finish_import_into(path, dest, r, job.started)
             }

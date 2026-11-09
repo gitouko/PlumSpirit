@@ -988,6 +988,26 @@ impl NoteStore {
         self.chunks.first().map(|c| c.first_start())
     }
 
+    /// Heap copied by the derived snapshot clone. Chunk payloads stay shared;
+    /// selection bits, chunk headers and prefix metadata are copied. O(chunks).
+    pub fn snapshot_workspace_bytes<E>(
+        &self,
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let mut bytes = self
+            .chunks
+            .len()
+            .saturating_mul(std::mem::size_of::<NoteChunk>())
+            .saturating_add(self.prefix_max_end.len().saturating_mul(8));
+        for (i, c) in self.chunks.iter().enumerate() {
+            if i.is_multiple_of(128) {
+                check()?;
+            }
+            bytes = bytes.saturating_add(c.sel.heap_bytes());
+        }
+        Ok(bytes)
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.chunks.iter().map(|c| c.heap_bytes()).sum::<usize>()
             + self.chunks.capacity() * std::mem::size_of::<NoteChunk>()
@@ -999,6 +1019,47 @@ impl NoteStore {
         let c = self.chunks.get(loc.chunk as usize)?;
         let i = loc.index as usize;
         (i < c.len()).then(|| c.view(i))
+    }
+
+    /// Read sorted ranks by walking chunk lengths, without scanning intervening
+    /// notes or allocating an index. Missing/decreasing ranks yield `None`.
+    /// Cost O(chunks traversed + requested ranks); both loops are cancellable.
+    pub fn try_visit_ranks<E>(
+        &self,
+        ranks: impl IntoIterator<Item = usize>,
+        mut check: impl FnMut() -> Result<(), E>,
+        mut visit: impl FnMut(usize, Option<NoteView>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let (mut ci, mut base) = (0usize, 0usize);
+        let mut previous = None;
+        for (i, rank) in ranks.into_iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                check()?;
+            }
+            if previous.is_some_and(|p| rank < p) {
+                visit(rank, None)?;
+                continue;
+            }
+            previous = Some(rank);
+            while let Some(c) = self.chunks.get(ci) {
+                if rank < base + c.len() {
+                    break;
+                }
+                base += c.len();
+                ci += 1;
+                if ci.is_multiple_of(64) {
+                    check()?;
+                }
+            }
+            let note = rank.checked_sub(base).and_then(|offset| {
+                self.chunks
+                    .get(ci)
+                    .filter(|c| offset < c.len())
+                    .map(|c| c.view(offset))
+            });
+            visit(rank, note)?;
+        }
+        Ok(())
     }
 
     /// Iterates all notes in stored (start-tick) order. Intended for export, copy and
@@ -1162,6 +1223,70 @@ impl NoteStore {
                 }
             }
         }
+    }
+
+    /// Indexed overlap query with global ranks and fallible bounded checkpoints.
+    /// Unlike calling `rank_of` for each hit, chunk rank bases are walked once.
+    /// `visit = false` stops successfully; errors never continue scanning.
+    pub fn try_query_ranked<E>(
+        &self,
+        t0: u64,
+        t1: u64,
+        mut check: impl FnMut() -> Result<(), E>,
+        mut visit: impl FnMut(usize, NoteView) -> Result<bool, E>,
+    ) -> Result<QueryStats, E> {
+        check()?;
+        let mut stats = QueryStats {
+            chunks_total: self.chunks.len(),
+            ..Default::default()
+        };
+        if t0 > t1 {
+            return Ok(stats);
+        }
+        let hi = self.chunks.partition_point(|c| c.first_start() <= t1);
+        let lo = self.prefix_max_end.partition_point(|&m| m < t0).min(hi);
+        let mut base = 0usize;
+        for chunks in self.chunks[..lo].chunks(1024) {
+            check()?;
+            base += chunks.iter().map(|c| c.len()).sum::<usize>();
+        }
+        for ch in &self.chunks[lo..hi] {
+            check()?;
+            let c = &ch.data;
+            if c.max_end >= t0 {
+                stats.chunks_visited += 1;
+                let a = c
+                    .start
+                    .partition_point(|&s| s < t0.saturating_sub(c.max_dur));
+                let b = c.start.partition_point(|&s| s <= t1);
+                for i in a..b {
+                    if stats.notes_scanned.is_multiple_of(4096) {
+                        check()?;
+                    }
+                    stats.notes_scanned += 1;
+                    let (s, d) = (c.start[i], c.dur[i]);
+                    if s.saturating_add(d) < t0 {
+                        continue;
+                    }
+                    stats.notes_matched += 1;
+                    let view = NoteView {
+                        start_tick: s,
+                        duration_ticks: d,
+                        attrs: c.attrs[i],
+                        sub: SubchannelId(c.sub.as_ref().get(i)),
+                        group: c.grp.as_ref().get(i),
+                        selected: ch.sel.get(i),
+                    };
+                    if !visit(base + i, view)? {
+                        check()?;
+                        return Ok(stats);
+                    }
+                }
+            }
+            base += c.len();
+        }
+        check()?;
+        Ok(stats)
     }
 
     /// [`NoteStore::query`]'s notes in reverse stored order (latest start
@@ -1550,9 +1675,48 @@ impl NoteStore {
         })
     }
 
-    /// Inserts many notes (sorted by start tick) with a per-chunk merge. Each affected
-    /// chunk is merged once, so the cost is O(affected chunk sizes + records) rather
-    /// than one array shift per note. Validation happens before any mutation.
+    /// Conservative workspace estimate for the same sorted insertion, excluding
+    /// the caller's incoming-record/history buffers. Visits chunk metadata, not all
+    /// notes. Includes touched packed payloads, metadata and selection workspace;
+    /// this is a reservation bound, not a process RSS measurement. `records` must
+    /// be sorted by start, as for [`Self::insert_sorted_batch`].
+    pub fn insertion_workspace_bytes<E>(
+        &self,
+        records: &[NoteRecord],
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let mut r = 0;
+        let mut touched = 0usize;
+        let mut affected = 0usize;
+        for (ci, chunk) in self.chunks.iter().enumerate() {
+            if ci.is_multiple_of(64) {
+                check()?;
+            }
+            let end = if let Some(next) = self.chunks.get(ci + 1) {
+                r + records[r..].partition_point(|n| n.start_tick < next.first_start())
+            } else {
+                records.len()
+            };
+            if end > r {
+                touched = touched.saturating_add(chunk.len());
+                affected += 1;
+            }
+            r = end;
+        }
+        let chunks = self
+            .chunks
+            .len()
+            .saturating_add(records.len() / self.chunk_target)
+            .saturating_add(affected)
+            .saturating_add(2);
+        Ok(touched
+            .saturating_mul(32)
+            .saturating_add(chunks.saturating_mul(std::mem::size_of::<NoteChunk>() * 4 + 64))
+            .saturating_add(self.len.div_ceil(8).saturating_mul(2)))
+    }
+
+    /// Inserts many notes sorted by start tick, merging each affected chunk once.
+    /// Cost is O(affected chunk sizes + records), with validation before mutation.
     pub fn insert_sorted_batch(
         &mut self,
         records: &[NoteRecord],
@@ -3477,6 +3641,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_workspace_counts_only_copied_metadata_and_selection_with_cancellation() {
+        let records: Vec<_> = (0..100_000).map(|i| rec(i, 1, 60)).collect();
+        let store = NoteStore::from_sorted_records(&records, false).unwrap();
+        let mut checks = 0;
+        let bytes = store
+            .snapshot_workspace_bytes(|| {
+                checks += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(bytes > 0 && bytes < store.heap_bytes() / 4);
+        assert!(
+            checks > 0 && checks < 100_000 / 128,
+            "checks follow chunk metadata, not notes"
+        );
+        let mut copy = store.clone();
+        copy.select_all();
+        assert_eq!(store.selected_count(), 0);
+        assert_eq!(copy.selected_count(), 100_000);
+        assert_eq!(
+            store.snapshot_workspace_bytes(|| Err("canceled")),
+            Err("canceled")
+        );
+        assert_eq!(store.len(), 100_000);
+    }
+
     fn brute(store: &NoteStore, t0: u64, t1: u64) -> Vec<NoteView> {
         store
             .iter()
@@ -4050,5 +4241,198 @@ mod tests {
         assert_eq!(s.len(), 10_000 - removed.len());
         assert_eq!(s.selected_count(), 0);
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn insertion_workspace_uses_touched_chunk_metadata_and_checks_cancellation() {
+        let records: Vec<_> = (0..100_000).map(|i| rec(i * 10, 1, 60)).collect();
+        let mut s = NoteStore::with_chunk_target(256);
+        s.insert_sorted_batch(&records, false).unwrap();
+        let one = s
+            .insertion_workspace_bytes(&[rec(10, 1, 70)], || Ok::<_, ()>(()))
+            .unwrap();
+        let all = s
+            .insertion_workspace_bytes(&records, || Ok::<_, ()>(()))
+            .unwrap();
+        assert!(
+            one < 1_000_000,
+            "small insert must not budget every existing payload: {one}"
+        );
+        assert!(all > one + 3_000_000);
+        let fingerprint: Vec<_> = s.iter().map(|n| n.record()).collect();
+        let mut checks = 0;
+        assert_eq!(
+            s.insertion_workspace_bytes(&records, || {
+                checks += 1;
+                if checks == 2 { Err("canceled") } else { Ok(()) }
+            }),
+            Err("canceled")
+        );
+        assert_eq!(
+            s.iter().map(|n| n.record()).collect::<Vec<_>>(),
+            fingerprint
+        );
+        let empty = NoteStore::new()
+            .insertion_workspace_bytes(&records, || Ok::<_, ()>(()))
+            .unwrap();
+        assert!(empty < all);
+    }
+
+    #[test]
+    fn sparse_rank_visits_skip_note_payloads_and_report_stale_or_decreasing_ranks() {
+        let records: Vec<_> = (0..100_000).map(|i| rec(i, 1, 60)).collect();
+        let mut s = NoteStore::with_chunk_target(64);
+        s.insert_sorted_batch(&records, false).unwrap();
+        let mut found = Vec::new();
+        let mut checks = 0;
+        s.try_visit_ranks(
+            [1, 50_000, 99_999, 100_000, 2],
+            || {
+                checks += 1;
+                Ok::<_, ()>(())
+            },
+            |rank, note| {
+                found.push((rank, note.map(|n| n.start_tick)));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (1, Some(1)),
+                (50_000, Some(50_000)),
+                (99_999, Some(99_999)),
+                (100_000, None),
+                (2, None)
+            ]
+        );
+        assert!(
+            checks > 1 && checks < 30,
+            "checks follow chunk metadata, not every intervening note"
+        );
+        assert_eq!(
+            s.try_visit_ranks([99_999], || Err("canceled"), |_, _| Ok(())),
+            Err("canceled")
+        );
+        assert_eq!(s.len(), 100_000);
+    }
+}
+
+#[cfg(test)]
+mod ranked_query_tests {
+    use super::*;
+    use crate::model::{NoteOffKind, RankSetBuilder};
+    use std::cell::Cell;
+    fn rec(start: u64, duration: u64) -> NoteRecord {
+        NoteRecord {
+            start_tick: start,
+            duration_ticks: duration,
+            attrs: NoteAttrs::new(60, 100, 0, 0, NoteOffKind::NoteOff).unwrap(),
+            sub: SubchannelId::MAIN,
+            group: 0,
+        }
+    }
+    #[test]
+    fn controlled_indexed_ranks_match_brute_force_records_and_selection() {
+        let mut store = NoteStore::with_chunk_target(128);
+        let records = (0..17000)
+            .map(|i| rec(i * 7 / 3, if i % 131 == 0 { 9000 } else { i % 29 }))
+            .collect::<Vec<_>>();
+        store.insert_sorted_batch(&records, false).unwrap();
+        let mut ranks = RankSetBuilder::default();
+        for r in (0..records.len()).step_by(3) {
+            ranks.push(r);
+        }
+        store.select_ranks(&ranks.finish()).unwrap();
+        for (lo, hi) in [
+            (0, 0),
+            (1, 100),
+            (500, 500),
+            (4000, 6000),
+            (20000, 50000),
+            (u64::MAX / 2, u64::MAX),
+            (u64::MAX, 0),
+        ] {
+            let expected = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    lo <= hi && r.start_tick <= hi && r.start_tick + r.duration_ticks >= lo
+                })
+                .map(|(i, r)| (i, *r, i % 3 == 0))
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let stats = store
+                .try_query_ranked(
+                    lo,
+                    hi,
+                    || Ok::<(), ()>(()),
+                    |rank, n| {
+                        actual.push((rank, n.record(), n.selected));
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(stats.notes_matched, expected.len());
+            assert!(stats.notes_scanned <= store.len());
+            assert!(stats.chunks_visited <= stats.chunks_total);
+        }
+        let mut actual = Vec::new();
+        let stats = store
+            .try_query_ranked(
+                0,
+                u64::MAX,
+                || Ok::<(), ()>(()),
+                |rank, _| {
+                    actual.push(rank);
+                    Ok(actual.len() < 7)
+                },
+            )
+            .unwrap();
+        assert_eq!(actual, (0..7).collect::<Vec<_>>());
+        assert_eq!(stats.notes_matched, 7);
+    }
+    #[test]
+    fn rejected_note_scans_cancel_at_bounded_checkpoints_and_visitor_errors_stop() {
+        let mut store = NoteStore::with_chunk_target(65536);
+        let mut records = vec![rec(0, 0); 16000];
+        records[0] = rec(0, 1000000);
+        store.insert_sorted_batch(&records, false).unwrap();
+        let checks = Cell::new(0);
+        let visited = Cell::new(0);
+        let result = store.try_query_ranked(
+            1000,
+            2000,
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 4 {
+                    Err("canceled")
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                visited.set(visited.get() + 1);
+                Ok(true)
+            },
+        );
+        assert_eq!(result.unwrap_err(), "canceled");
+        assert_eq!(checks.get(), 4);
+        assert_eq!(visited.get(), 1);
+        assert_eq!(store.len(), 16000);
+        let result = store.try_query_ranked(0, u64::MAX, || Ok(()), |_, _| Err("consumer"));
+        assert_eq!(result.unwrap_err(), "consumer");
+        let stats = store
+            .try_query_ranked(
+                1000001,
+                u64::MAX,
+                || Ok::<(), ()>(()),
+                |_, _| panic!("all off-range chunks excluded"),
+            )
+            .unwrap();
+        assert_eq!(stats.notes_scanned, 0);
+        assert_eq!(stats.chunks_visited, 0);
     }
 }

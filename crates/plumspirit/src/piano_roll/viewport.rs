@@ -27,6 +27,34 @@ use plumspirit_engine::view::{
     MAX_PIXELS_PER_TICK, MAX_ROW_HEIGHT, MIN_PIXELS_PER_TICK, MIN_ROW_HEIGHT, PitchAxis, TimeAxis,
     clamp_zoom,
 };
+/// Exact geometry/context of an authorized, actually drawn native note surface.
+/// Contains no document ownership, pointer events or note buffers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewFrame {
+    pub rect: egui::Rect,
+    pub view: RollView,
+    pub shift: i128,
+    pub track: plumspirit_engine::model::TrackId,
+    pub content: Option<plumspirit_engine::model::ContentId>,
+    pub locked: bool,
+    pub conductor: bool,
+    pub pixels_per_point: f32,
+    pub(crate) document: usize,
+    pub(crate) revisions: [u64; 4],
+}
+impl ViewFrame {
+    pub fn matches(&self, doc: &PlumDocument) -> bool {
+        self.document == std::ptr::from_ref(doc) as usize
+            && self.revisions
+                == [
+                    doc.structure_revision(),
+                    doc.analysis_revision(),
+                    doc.layout_revision(),
+                    doc.tempo_revision(),
+                ]
+            && self.view.pitch.top == doc.project().keys.max_pitch()
+    }
+}
 
 pub const DEFAULT_ROW_HEIGHT: f64 = 12.0;
 /// Points per quarter note at Zoom X 100 %.
@@ -254,13 +282,13 @@ impl RollView {
         let mut hi = 0u8;
         let mut n = 0;
         let span = doc.division().musical_ppqn().unwrap_or(480) * 16;
-        t.notes.query(first, first.saturating_add(span), |_, v| {
-            if n < 5000 {
+        t.notes
+            .query_while(first, first.saturating_add(span), |_, v| {
                 lo = lo.min(v.attrs.pitch());
                 hi = hi.max(v.attrs.pitch());
                 n += 1;
-            }
-        });
+                n < 5000
+            });
         if n == 0 {
             60.0
         } else {

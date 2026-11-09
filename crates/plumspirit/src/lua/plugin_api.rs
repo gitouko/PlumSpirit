@@ -56,11 +56,18 @@ pub struct Decls {
     pub commands: Vec<CommandDecl>,
     /// Custom note tools (Tools → Custom, B1-0045).
     pub tools: Vec<super::custom::ToolDecl>,
+    pub observers: Vec<super::reactive::ObserverDecl>,
+    pub services: Vec<super::services::ServiceDecl>,
+    pub formats: Vec<super::formats::FormatDecl>,
 }
 
 impl Decls {
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty() && self.tools.is_empty()
+        self.commands.is_empty()
+            && self.tools.is_empty()
+            && self.observers.is_empty()
+            && self.services.is_empty()
+            && self.formats.is_empty()
     }
 }
 
@@ -79,6 +86,7 @@ pub enum Phase {
 pub(super) struct PluginSlot {
     pub meta: PluginMeta,
     pub phase: Phase,
+    pub extensibility_ready: bool,
     pub decls: Decls,
     /// The declarations changed since the host last reported them.
     pub changed: bool,
@@ -134,6 +142,7 @@ pub fn text_field(
 
 /// Fails unless the plugin is still loading.
 pub(super) fn require_loading(lua: &Lua, what: &str) -> mlua::Result<()> {
+    super::services::check_write(lua)?;
     let phase = lua
         .app_data_ref::<PluginSlot>()
         .map(|s| s.phase)
@@ -150,38 +159,45 @@ pub(super) fn require_loading(lua: &Lua, what: &str) -> mlua::Result<()> {
 pub(super) fn install(lua: &Lua, meta: PluginMeta) -> mlua::Result<()> {
     let plum: Table = lua.globals().get("plum")?;
     let p = lua.create_table()?;
+    super::files::install_assets(lua, &p)?;
     super::config::install(
         lua,
         &plum,
         super::config::ConfigSlot::new(&meta.id, meta.data_dir.clone(), meta.config_version),
     )?;
-    let ui = lua.create_table()?;
+    let ui = plum.raw_get::<Table>("ui")?;
     ui.set(
         "notify",
-        lua.create_function(|lua, (text, kind): (String, Option<String>)| {
-            let kind = match kind.as_deref().unwrap_or("info") {
-                "info" => NoticeKind::Info,
-                "warning" => NoticeKind::Warning,
-                "error" => NoticeKind::Error,
-                other => {
-                    return Err(runtime(format!(
-                        "notify's kind is \"info\", \"warning\" or \"error\", not \"{other}\"."
-                    )));
+        lua.create_function(
+            |lua, (text, kind): (mlua::LuaString, Option<mlua::LuaString>)| {
+                super::services::check_write(lua)?;
+                let kind = kind.as_ref().map(mlua::LuaString::to_str).transpose()?;
+                let kind = match kind.as_deref().unwrap_or("info") {
+                    "info" => NoticeKind::Info,
+                    "warning" => NoticeKind::Warning,
+                    "error" => NoticeKind::Error,
+                    other => {
+                        let other = super::diagnostic_text(other, 64);
+                        return Err(runtime(format!(
+                            "notify's kind is \"info\", \"warning\" or \"error\", not \"{other}\"."
+                        )));
+                    }
+                };
+                let text: String = text
+                    .to_str()?
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == ' ')
+                    .take(300)
+                    .collect();
+                if let Some(mut n) = lua.app_data_mut::<Notices>()
+                    && n.0.len() < MAX_NOTICES
+                    && !text.trim().is_empty()
+                {
+                    n.0.push((text, kind));
                 }
-            };
-            let text: String = text
-                .chars()
-                .filter(|c| !c.is_control() || *c == ' ')
-                .take(300)
-                .collect();
-            if let Some(mut n) = lua.app_data_mut::<Notices>()
-                && n.0.len() < MAX_NOTICES
-                && !text.trim().is_empty()
-            {
-                n.0.push((text, kind));
-            }
-            Ok(())
-        })?,
+                Ok(())
+            },
+        )?,
     )?;
     plum.set("ui", ui)?;
     lua.set_app_data(Notices::default());
@@ -193,6 +209,7 @@ pub(super) fn install(lua: &Lua, meta: PluginMeta) -> mlua::Result<()> {
     lua.set_app_data(PluginSlot {
         meta,
         phase: Phase::Load,
+        extensibility_ready: false,
         decls: Decls::default(),
         changed: false,
     });
@@ -272,6 +289,9 @@ pub(super) fn install(lua: &Lua, meta: PluginMeta) -> mlua::Result<()> {
             };
             if let Some(mut s) = lua.app_data_mut::<PluginSlot>() {
                 s.phase = phase;
+                if phase == Phase::Ready {
+                    s.extensibility_ready = true;
+                }
             }
             Ok(())
         })?,
@@ -280,37 +300,15 @@ pub(super) fn install(lua: &Lua, meta: PluginMeta) -> mlua::Result<()> {
         "__run",
         lua.create_function(
             |lua, (id, raw): (String, Option<Table>)| -> mlua::Result<Value> {
-                let decl = lua
-                    .app_data_ref::<PluginSlot>()
-                    .and_then(|s| s.decls.commands.iter().find(|c| c.id == id).cloned());
-                let fns: Table = lua.named_registry_value(COMMANDS)?;
-                let f: Function = match fns.get::<Value>(id.as_str())? {
-                    Value::Function(f) => f,
-                    _ => {
-                        return Err(runtime(format!(
-                            "The command \u{201C}{id}\u{201D} is not registered by this plugin."
-                        )));
-                    }
-                };
-                let ctx = lua.create_table()?;
-                if let Some(d) = decl
-                    && !d.params.is_empty()
-                {
-                    let raw = match raw {
-                        Some(t) => t,
-                        None => lua.create_table()?,
-                    };
-                    ctx.set(
-                        "params",
-                        super::custom::params_to_ctx(lua, &d.params, &raw)?,
-                    )?;
-                }
-                ctx.set("command", id)?;
-                f.call::<Value>(ctx)
+                invoke(lua, &id, raw, None)
             },
         )?,
     )?;
     super::custom::install(lua, &p)?;
+    super::reactive::install(lua, &p)?;
+    super::response::install(lua, &p)?;
+    super::services::install(lua, &p)?;
+    super::formats::install(lua, &p)?;
     plum.set("plugin", p)?;
     Ok(())
 }
@@ -334,4 +332,45 @@ pub(super) fn take_decls(lua: &Lua) -> Option<Decls> {
     }
     s.changed = false;
     Some(s.decls.clone())
+}
+
+pub(super) fn invoke(
+    lua: &Lua,
+    id: &str,
+    raw: Option<Table>,
+    extra: Option<Table>,
+) -> mlua::Result<Value> {
+    let decl = lua
+        .app_data_ref::<PluginSlot>()
+        .and_then(|s| s.decls.commands.iter().find(|c| c.id == id).cloned());
+    let fns: Table = lua.named_registry_value(COMMANDS)?;
+    let f: Function = match fns.get::<Value>(id)? {
+        Value::Function(f) => f,
+        _ => {
+            return Err(runtime(format!(
+                "The command \u{201C}{id}\u{201D} is not registered by this plugin."
+            )));
+        }
+    };
+    let ctx = lua.create_table()?;
+    if let Some(d) = decl
+        && !d.params.is_empty()
+    {
+        let raw = match raw {
+            Some(t) => t,
+            None => lua.create_table()?,
+        };
+        ctx.set(
+            "params",
+            super::custom::params_to_ctx(lua, &d.params, &raw)?,
+        )?;
+    }
+    ctx.set("command", id)?;
+    if let Some(extra) = extra {
+        for pair in extra.pairs::<String, Value>() {
+            let (k, v) = pair?;
+            ctx.set(k, v)?;
+        }
+    }
+    f.call::<Value>(ctx)
 }

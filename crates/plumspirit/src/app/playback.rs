@@ -68,6 +68,7 @@ impl PlumSpiritApp {
         // Play is an explicit transport action: Follow Playhead resumes from the
         // current position.
         if starting && self.transport.state().is_running() {
+            self.seek_follow_view = None;
             if self.settings.audio.prerender {
                 self.preroll_watch = Some((std::time::Instant::now(), false));
             }
@@ -85,6 +86,7 @@ impl PlumSpiritApp {
     /// anchor (the Edit playhead, or where this playback started).
     pub(super) fn stop_playback(&mut self) {
         self.transport.stop();
+        self.seek_follow_view = None;
         self.preroll_watch = None;
         self.follow_suspended = false;
         self.inspector.follow_suspended = false;
@@ -121,14 +123,53 @@ impl PlumSpiritApp {
         self.follow_suspended = false;
         self.inspector.follow_suspended = false;
         self.sel_charts.follow_suspended = false;
-        self.roll.reveal(tick, doc.duration_ticks());
+        self.seek_follow_view = None;
+        self.reveal_song_tick(tick, doc.duration_ticks());
+    }
+
+    /// The transport speaks song ticks; the roll speaks content ticks.
+    fn reveal_song_tick(&mut self, tick: u64, end: u64) {
+        let shift = self.edit_shift();
+        self.roll.reveal(
+            super::clip_session::shifted(tick, -shift),
+            super::clip_session::shifted(end, -shift),
+        );
+    }
+
+    /// A ruler seek past the follow anchor should keep the current view until
+    /// playback leaves it. A new axis or a manual view change ends this hold.
+    pub(super) fn seek_from_roll(&mut self, tick: u64) {
+        use crate::piano_roll::viewport::{FollowStyle, follow_origin};
+
+        let time = self.roll.view.time;
+        self.seek_to(tick);
+        if self.transport.state().is_running()
+            && self.settings.follow_playhead
+            && time == self.roll.view.time
+        {
+            let width = self.roll.view_width();
+            let local = self.to_content(tick);
+            let end = self.to_content(self.doc().map_or(0, PlumDocument::duration_ticks));
+            let style = if self.settings.smooth_follow {
+                FollowStyle::Smooth
+            } else {
+                FollowStyle::Page
+            };
+            let anchor = f64::from(self.settings.follow_position.min(100)) / 100.0;
+            if (0.0..=width).contains(&time.tick_to_x(local))
+                && follow_origin(&time, width, local, end, style, anchor).is_some()
+            {
+                self.seek_follow_view = Some((time, self.edit_shift()));
+            }
+        }
     }
 
     /// Scrolls so the playhead / edit position is visible.
     pub(super) fn reveal_playhead(&mut self) {
         let end = self.doc().map_or(0, PlumDocument::duration_ticks);
         let pos = self.transport.position();
-        self.roll.reveal(pos, end);
+        self.seek_follow_view = None;
+        self.reveal_song_tick(pos, end);
     }
 
     pub(super) fn update_transport(&mut self, _ctx: &egui::Context) {

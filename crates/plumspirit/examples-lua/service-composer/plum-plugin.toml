@@ -1,0 +1,10 @@
+id = "plumspirit.example.service-composer"
+name = "Composable Services Laboratory"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Calls the separately installed note provider and commits author-written results through native Undo."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "notes.edit", "services.call"]
+service_dependencies = ["plumspirit.example.note-service/pattern@1.0", "plumspirit.example.note-service/transform@1.0"]

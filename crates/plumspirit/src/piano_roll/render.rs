@@ -23,6 +23,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "store_preview_tests.rs"]
+mod store_preview_tests;
+
 /// Reused rendering buffers (no per-frame allocation of large vectors).
 #[derive(Default)]
 pub struct RenderCache {
@@ -35,7 +39,7 @@ pub struct RenderCache {
 
 /// A tool preview's meshes for one (content, track revision, view) key.
 pub struct ToolPreviewCache {
-    key: (u64, u64, [u64; 4], [u32; 4], bool, u64),
+    key: (u64, u64, [u64; 5], [u32; 4], bool, u64),
     coverage: std::sync::Arc<Mesh>,
     notes: std::sync::Arc<Mesh>,
     drawn: usize,
@@ -1398,6 +1402,9 @@ pub fn draw_added(
 /// difference array per row), drawn as merged runs. At most this many results
 /// are visited per frame; beyond it the preview says it is simplified.
 pub const PREVIEW_AGG_BUDGET: usize = 2_000_000;
+/// Includes native query metadata/checkpoints and rejected/off-row candidates.
+/// Each indexed query checkpoint covers at most4096candidate records.
+pub const STORE_PREVIEW_CHECKPOINTS: usize = 64;
 /// Width of one aggregation column, points.
 const AGG_PX: f32 = 2.0;
 /// Lazy previews evaluate the kernel in batches of this many results.
@@ -1522,17 +1529,23 @@ pub fn draw_tool_preview(
     use plumspirit_engine::transform::{Output, TNote};
     let palette = crate::ui::theme::note_palette(p.ctx());
     let rev = match tp {
-        super::ToolPreview::Run { rev, .. } | super::ToolPreview::Lazy { rev, .. } => *rev,
+        super::ToolPreview::Run { rev, .. }
+        | super::ToolPreview::Lazy { rev, .. }
+        | super::ToolPreview::Store { rev, .. } => *rev,
     };
     let v = &g.view;
     let key = (
         rev,
-        track.notes.revision(),
+        match tp {
+            super::ToolPreview::Store { notes, .. } => notes.content_revision(),
+            _ => track.notes.revision(),
+        },
         [
             v.time.origin_tick,
             v.time.pixels_per_tick.to_bits(),
             v.pitch.scroll_rows.to_bits(),
             v.pitch.row_height.to_bits(),
+            u64::from(v.pitch.top),
         ],
         [
             g.notes.left().to_bits(),
@@ -1591,6 +1604,33 @@ pub fn draw_tool_preview(
         true
     };
     match tp {
+        super::ToolPreview::Store { notes, .. } => {
+            let mut checks = 0usize;
+            let mut stopped = false;
+            let result = notes.try_query_ranked(
+                t0,
+                t1,
+                || {
+                    checks += 1;
+                    if checks > STORE_PREVIEW_CHECKPOINTS {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, v| {
+                    let more = draw(
+                        &TNote::from_record(&v.record(), 0),
+                        &mut mesh,
+                        &mut prims,
+                        &mut cov,
+                    );
+                    stopped |= !more;
+                    Ok(more)
+                },
+            );
+            cut = stopped || result.is_err();
+        }
         super::ToolPreview::Run {
             notes,
             extra,

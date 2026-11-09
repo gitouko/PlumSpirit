@@ -34,6 +34,17 @@ impl PlumSpiritApp {
     /// Runs a plugin command: at once, or after its options dialog when it
     /// declares options.
     pub(super) fn run_lua_command(&mut self, plugin: &str, command: &str, dark: bool) {
+        if let Some((mode, id)) = super::lua_formats::parse_action(command) {
+            self.start_lua_format(plugin, id, mode);
+            return;
+        }
+        if self.lua_formats.reviewing() {
+            self.set_status(
+                "Apply or Cancel the import before running another command.",
+                StatusKind::Warning,
+            );
+            return;
+        }
         let decl = self.lua_plugins.as_ref().and_then(|m| {
             let p = m.plugin(plugin)?;
             let d = p.decls.commands.iter().find(|c| c.id == command)?;

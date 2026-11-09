@@ -531,7 +531,16 @@ impl<S: Sink> Pen<S> {
 
     /// One segment: a piece per row it stays on (rows outside the band are
     /// clipped away first).
-    fn segment(&mut self, p0: (f64, f64), p1: (f64, f64), brush: Brush) -> bool {
+    fn segment_controlled(
+        &mut self,
+        p0: (f64, f64),
+        p1: (f64, f64),
+        brush: Brush,
+        check: &mut impl FnMut() -> bool,
+    ) -> bool {
+        if !check() {
+            return false;
+        }
         let ((x0, y0), (x1, y1)) = (p0, p1);
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             return true;
@@ -567,7 +576,12 @@ impl<S: Sink> Pen<S> {
         let dir = if rb > ra { 1 } else { -1 };
         let mut r = ra;
         let mut s0 = 0.0f64;
+        let mut visited = 0usize;
         loop {
+            if visited.is_multiple_of(64) && !check() {
+                return false;
+            }
+            visited += 1;
             let s1 = if r == rb {
                 1.0
             } else {
@@ -589,21 +603,35 @@ impl<S: Sink> Pen<S> {
         }
         true
     }
-}
-
-impl<S: Sink> Draw for Pen<S> {
-    fn stroke(&mut self, pts: &[(f64, f64)], brush: Brush) -> bool {
-        self.stroke_with(pts, std::slice::from_ref(&brush))
+    /// Preflight the fill crossing workspace before an untrusted bounded call.
+    pub fn reserve_fill(
+        &mut self,
+        vertices: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.xs.try_reserve_exact(vertices)
     }
 
-    fn stroke_with(&mut self, pts: &[(f64, f64)], brushes: &[Brush]) -> bool {
-        if brushes.is_empty() {
-            return true;
+    /// Same native stroke/merging rules with bounded segment and row stop checks.
+    pub fn stroke_controlled(
+        &mut self,
+        pts: &[(f64, f64)],
+        brush: Brush,
+        mut check: impl FnMut() -> bool,
+    ) -> bool {
+        self.stroke_part_controlled(pts, std::slice::from_ref(&brush), &mut check)
+            && check()
+            && self.flush()
+    }
+
+    fn stroke_part_controlled(
+        &mut self,
+        pts: &[(f64, f64)],
+        brushes: &[Brush],
+        check: &mut impl FnMut() -> bool,
+    ) -> bool {
+        if !check() {
+            return false;
         }
-        self.stroke_part(pts, brushes) && self.flush()
-    }
-
-    fn stroke_part(&mut self, pts: &[(f64, f64)], brushes: &[Brush]) -> bool {
         let Some(&last) = brushes.last() else {
             return true;
         };
@@ -615,14 +643,23 @@ impl<S: Sink> Draw for Pen<S> {
         }
         for (i, w) in pts.windows(2).enumerate() {
             let b = brushes.get(i).copied().unwrap_or(last);
-            if !self.segment(w[0], w[1], b) {
+            if !self.segment_controlled(w[0], w[1], b, check) {
                 return false;
             }
         }
         true
     }
 
-    fn fill(&mut self, poly: &[(f64, f64)], brush: Brush) -> bool {
+    /// Same native even-odd rasterizer with cooperative stop checks, including empty rows.
+    pub fn fill_controlled(
+        &mut self,
+        poly: &[(f64, f64)],
+        brush: Brush,
+        mut check: impl FnMut() -> bool,
+    ) -> bool {
+        if !check() {
+            return false;
+        }
         if !self.flush() {
             return false;
         }
@@ -640,16 +677,28 @@ impl<S: Sink> Draw for Pen<S> {
         let mut xs = std::mem::take(&mut self.xs);
         let mut ok = true;
         'rows: for r in r0..=r1 {
+            if !check() {
+                ok = false;
+                break;
+            }
             let yc = r as f64 + 0.5;
             xs.clear();
             for k in 0..poly.len() {
+                if k.is_multiple_of(64) && !check() {
+                    ok = false;
+                    break 'rows;
+                }
                 let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
                 if (a.1 <= yc && yc < b.1) || (b.1 <= yc && yc < a.1) {
                     xs.push(a.0 + (yc - a.1) * (b.0 - a.0) / (b.1 - a.1));
                 }
             }
             xs.sort_by(f64::total_cmp);
-            for pair in xs.chunks_exact(2) {
+            for (i, pair) in xs.chunks_exact(2).enumerate() {
+                if i.is_multiple_of(64) && !check() {
+                    ok = false;
+                    break 'rows;
+                }
                 if pair[1] > pair[0] && !(self.piece(pair[0], pair[1], r, brush) && self.flush()) {
                     ok = false;
                     break 'rows;
@@ -658,6 +707,27 @@ impl<S: Sink> Draw for Pen<S> {
         }
         self.xs = xs;
         ok
+    }
+}
+
+impl<S: Sink> Draw for Pen<S> {
+    fn stroke(&mut self, pts: &[(f64, f64)], brush: Brush) -> bool {
+        self.stroke_with(pts, std::slice::from_ref(&brush))
+    }
+
+    fn stroke_with(&mut self, pts: &[(f64, f64)], brushes: &[Brush]) -> bool {
+        if brushes.is_empty() {
+            return true;
+        }
+        self.stroke_part(pts, brushes) && self.flush()
+    }
+
+    fn stroke_part(&mut self, pts: &[(f64, f64)], brushes: &[Brush]) -> bool {
+        self.stroke_part_controlled(pts, brushes, &mut || true)
+    }
+
+    fn fill(&mut self, poly: &[(f64, f64)], brush: Brush) -> bool {
+        self.fill_controlled(poly, brush, || true)
     }
 
     fn note(&mut self, x0: f64, x1: f64, row: i64, brush: Brush) -> bool {
@@ -685,6 +755,36 @@ mod tests {
         gate: 1.0,
         sub: 0,
     };
+
+    #[test]
+    fn controlled_empty_fill_stops_and_preserves_preflight_workspace_for_reuse() {
+        let mut p = Pen::new(Rec::default(), 1, Band { lo: 0, hi: 4096 });
+        p.reserve_fill(4).unwrap();
+        let mut checks = 0;
+        assert!(
+            !p.fill_controlled(&[(1., 0.), (1., 4096.), (1., 4096.)], B, || {
+                checks += 1;
+                checks < 10
+            })
+        );
+        assert_eq!(checks, 10);
+        assert!(p.xs.capacity() >= 4);
+        assert!(p.fill(&[(0., 0.), (4., 0.), (4., 2.), (0., 2.)], B));
+        assert_eq!(p.finish().0, vec![(0, 4, 0), (0, 4, 1)]);
+    }
+
+    #[test]
+    fn controlled_stroke_stops_inside_a_long_segment() {
+        let mut p = Pen::new(Rec::default(), 1, Band { lo: 0, hi: 4096 });
+        let mut checks = 0;
+        assert!(!p.stroke_controlled(&[(1., 0.), (1., 4096.)], B, || {
+            checks += 1;
+            checks < 5
+        }));
+        assert_eq!(checks, 5);
+        let notes = p.finish().0;
+        assert!(!notes.is_empty() && notes.len() <= 129);
+    }
 
     fn pen() -> Pen<Rec> {
         Pen::new(Rec::default(), 120, Band::around(128))

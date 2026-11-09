@@ -37,7 +37,7 @@ use super::super::registry::{BuildCtx, ToolDef, ToolSpec};
 use super::super::tools::geometry::Mesh;
 use super::super::{Curve, Kernel, TransformError};
 use super::area::{self, Cap, Contour, Figure, Geom, GeomSpec, Join, Op, Place, Rule, SEG_CAP};
-use super::draw::{Grad, Pt, flatten, resample};
+use super::draw::{Grad, Pt, cubic, flatten, resample};
 use super::pen::Draw;
 use super::region::{AreaCopy, GDir, P2, Scene, Style, XPat};
 use super::{Frame, Shapes};
@@ -1079,15 +1079,6 @@ impl Cfg {
             .for_each(|(_, o)| add(Cfg::operand_edges(o)));
         out
     }
-}
-
-fn cubic(p0: P2, p1: P2, p2: P2, p3: P2, t: f64) -> P2 {
-    let u = 1.0 - t;
-    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-    (
-        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
-        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
-    )
 }
 
 /// A contour through `pts` (local), edges tagged from `tag0`, its edges

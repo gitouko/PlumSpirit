@@ -405,10 +405,26 @@ impl PlumSpiritApp {
         let Some(doc) = self.open.as_ref().map(|o| o.doc.clone()) else {
             return;
         };
+        if self.lua_views.enabled {
+            let (rain, keyboard) = player_layout(rect, doc.project().keys.keys());
+            self.lua_views.player =
+                self.lua_observation_stamp()
+                    .map(|stamp| crate::lua::visual::PlayerFrame {
+                        rect,
+                        rain,
+                        keyboard,
+                        keys: doc.project().keys.keys() as u16,
+                        mapping: self.settings.player.mapping,
+                        seconds_ahead: self.settings.player.fall_seconds,
+                        pixels_per_point: ui.ctx().pixels_per_point(),
+                        stamp,
+                    });
+        }
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, crate::player::BACKGROUND);
         // (The snapshot is kept current in `update_live`, before the panels.)
         self.player_rainfall(ui, rect, dark);
+        self.paint_lua_overlays(ui, &painter, 1, None);
         let now = Instant::now();
         let fps = if running {
             self.player.frames.frame(now);

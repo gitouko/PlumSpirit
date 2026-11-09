@@ -27,6 +27,7 @@ pub mod expr;
 pub mod factor;
 pub mod folders;
 pub mod gate;
+pub mod interchange;
 pub mod ops;
 pub mod ppqn;
 pub mod preview;

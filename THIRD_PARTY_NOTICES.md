@@ -277,8 +277,11 @@ MICROSOFT_RUNTIME_NOTICE.txt in the source tree.
 | twox-hash | 2.1.5 | MIT | https://github.com/shepmaster/twox-hash |
 | type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | https://github.com/paholg/typenum |
+| unicode-bidi | 0.3.18 | MIT OR Apache-2.0 | https://github.com/servo/unicode-bidi |
 | unicode-general-category | 1.1.0 | Apache-2.0 | https://github.com/yeslogic/unicode-general-category |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident |
+| unicode-linebreak | 0.1.5 | Apache-2.0 | https://github.com/axelf4/unicode-linebreak |
+| unicode-script | 0.5.8 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-script |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-segmentation |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width |
 | uuid | 1.26.1 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
@@ -343,3 +346,9 @@ MICROSOFT_RUNTIME_NOTICE.txt in the source tree.
 | which | 8.0.6 | MIT | https://github.com/harryfei/which-rs.git |
 | winnow | 1.0.4 | MIT | https://github.com/winnow-rs/winnow |
 | xml-rs | 0.8.29 | MIT | https://github.com/kornelski/xml-rs |
+
+Harfrust0.12.0 uses the exact previously locked MIT source in
+`third_party/harfrust-0.12.0`, with one additive `GlyphBuffer::successful()` accessor
+to reject native operation/buffer exhaustion. Its shaping algorithms are unchanged.
+See `PLUMSPIRIT_PATCH.md`, `PLUMSPIRIT_PROVENANCE.json` and the upstream LICENSE there.
+External-font cache/runtime isolation is implemented by PlumSpirit, not by a library upgrade.

@@ -358,7 +358,7 @@ pub fn add_methods<M: UserDataMethods<LuaHandle>>(m: &mut M) {
         let filter = EventFilter::from_lua(opts.as_ref())?;
         host_of(lua, &this.0)?;
         Ok(LuaEventQuery {
-            host: this.0,
+            host: this.0.clone(),
             filter,
         })
     });

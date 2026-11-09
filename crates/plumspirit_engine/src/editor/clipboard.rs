@@ -2,24 +2,25 @@
 //!
 //! The clipboard owns compact copies of the copied notes (relative start, duration,
 //! packed pitch/velocity/channel/off data). It never refers to document memory, so
-//! deleting the source notes or the source track does not affect it. It is not
-//! mirrored to the operating-system clipboard.
+//! deleting the source notes or the source track does not affect it. The
+//! musical clipboard encodes these records without document references.
 
 use super::{EditError, PreparedEdit, try_records};
 use crate::model::document::PlumDocument;
-use crate::model::note::{NoteRecord, SubchannelId};
+use crate::model::note::NoteRecord;
 use crate::model::track::Subchannel;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Clipboard {
     /// Notes with `start_tick` relative to the earliest copied note, in stored order.
-    records: Vec<NoteRecord>,
+    pub(super) records: Vec<NoteRecord>,
     /// The subchannels the copied notes use (so a paste into another track can
     /// recreate the ones it lacks).
-    subs: Vec<Subchannel>,
+    pub(super) subs: Vec<Subchannel>,
     /// The groups the copied notes use, with their ancestors (v0.7): a paste
     /// creates fresh groups with the same names, colours and nesting.
-    groups: Vec<crate::model::GroupInfo>,
+    pub(super) groups: Vec<crate::model::GroupInfo>,
 }
 
 impl Clipboard {
@@ -33,11 +34,9 @@ impl Clipboard {
             return Ok(None);
         };
         let mut records = try_records(b.count)?;
-        let mut used: Vec<SubchannelId> = Vec::new();
+        let mut used = BTreeMap::new();
         track.notes.for_each_selected(|v| {
-            if used.last() != Some(&v.sub) {
-                used.push(v.sub);
-            }
+            used.entry(v.sub).or_insert(v.attrs.channel());
             records.push(NoteRecord {
                 start_tick: v.start_tick - b.min_start,
                 duration_ticks: v.duration_ticks,
@@ -46,11 +45,15 @@ impl Clipboard {
                 group: v.group,
             });
         });
-        used.sort();
-        used.dedup();
         let subs = used
-            .iter()
-            .filter_map(|id| track.subchannels().get(*id).cloned())
+            .into_iter()
+            .map(|(id, channel)| {
+                track
+                    .subchannels()
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| Subchannel::new(id, channel))
+            })
             .collect();
         Ok(Some(Clipboard {
             records,
@@ -82,6 +85,8 @@ impl Clipboard {
             }
         }
         out.records.sort_by_key(|r| r.start_tick);
+        out.subs.sort_by_key(|s| s.id);
+        out.groups.sort_by_key(|g| g.id);
         out
     }
 
@@ -135,21 +140,8 @@ impl Clipboard {
         at_tick: u64,
     ) -> Result<(PreparedEdit, crate::model::GroupTable), EditError> {
         let edit = self.prepare_paste(doc, track_index, at_tick)?;
-        let mut table = doc.project().groups.clone();
-        let mut map: Vec<(u32, u32)> = Vec::with_capacity(self.groups.len());
-        let first = table.reserve(self.groups.len() as u32);
-        for (k, g) in self.groups.iter().enumerate() {
-            map.push((g.id, first + k as u32));
-        }
-        let new_of = |old: u32| -> u32 { map.iter().find(|m| m.0 == old).map_or(0, |m| m.1) };
-        for g in &self.groups {
-            table.insert(crate::model::GroupInfo {
-                id: new_of(g.id),
-                parent: new_of(g.parent),
-                locked: false,
-                ..g.clone()
-            });
-        }
+        let (table, ids) = super::interchange::import_groups(&doc.project().groups, &self.groups)
+            .map_err(EditError::Invalid)?;
         let edit = match edit {
             PreparedEdit::InsertSelected {
                 host,
@@ -159,7 +151,7 @@ impl Clipboard {
                 new_subs,
             } => {
                 for r in &mut records {
-                    r.group = new_of(r.group);
+                    r.group = ids.get(&r.group).copied().unwrap_or(0);
                 }
                 PreparedEdit::InsertSelected {
                     host,
@@ -171,9 +163,6 @@ impl Clipboard {
             }
             other => other,
         };
-        table
-            .validate()
-            .map_err(|m| EditError::Invalid(format!("The copied groups are invalid ({m}).")))?;
         Ok((edit, table))
     }
 

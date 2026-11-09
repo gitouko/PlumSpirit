@@ -41,9 +41,9 @@ fn note(start: u64, pitch: u8) -> NoteRecord {
 }
 
 /// `return <expr>` in a host that reads `w`, with the handle as global `x`.
-fn eval(host: &Host, w: &World, x: Handle, expr: &str) -> Result<Plain, ScriptError> {
+fn eval(host: &Host, w: &World, x: &Handle, expr: &str) -> Result<Plain, ScriptError> {
     host.set_world(Some(w.clone()));
-    host.set_global_handle("x", x).unwrap();
+    host.set_global_handle("x", x.clone()).unwrap();
     host.run("h.lua", &format!("return {expr}"))
 }
 
@@ -62,15 +62,15 @@ fn a_track_handle_expires_with_its_track_and_undo_does_not_revive_it() {
     let t = w.track_at(1).unwrap();
     let id = d.track(1).unwrap().id();
     assert_eq!(
-        eval(&lua, &w, t, "x:valid()").unwrap(),
+        eval(&lua, &w, &t, "x:valid()").unwrap(),
         Plain::Boolean(true)
     );
     assert_eq!(
-        eval(&lua, &w, t, "x:kind()").unwrap(),
+        eval(&lua, &w, &t, "x:kind()").unwrap(),
         Plain::String("track".into())
     );
     assert_eq!(
-        eval(&lua, &w, t, "x:check() == x").unwrap(),
+        eval(&lua, &w, &t, "x:check() == x").unwrap(),
         Plain::Boolean(true)
     );
     // Deleting the track expires the handle.
@@ -78,10 +78,10 @@ fn a_track_handle_expires_with_its_track_and_undo_does_not_revive_it() {
         .unwrap();
     let w2 = world(&d, &mut h);
     assert_eq!(
-        eval(&lua, &w2, t, "x:valid()").unwrap(),
+        eval(&lua, &w2, &t, "x:valid()").unwrap(),
         Plain::Boolean(false)
     );
-    let e = expired(eval(&lua, &w2, t, "x:check()"));
+    let e = expired(eval(&lua, &w2, &t, "x:check()"));
     assert!(e.message.contains("track handle is expired"), "{e}");
     assert_eq!(e.line, Some(1), "the error names the script line: {e}");
     // Undo brings the track (same id) back, but not the old handle: it may
@@ -94,7 +94,7 @@ fn a_track_handle_expires_with_its_track_and_undo_does_not_revive_it() {
     assert!(fresh.is_valid(&w3));
     assert_ne!(fresh.key(), t.key());
     assert_eq!(
-        eval(&lua, &w3, fresh, "x:valid()").unwrap(),
+        eval(&lua, &w3, &fresh, "x:valid()").unwrap(),
         Plain::Boolean(true)
     );
 }
@@ -117,7 +117,7 @@ fn a_subtrack_handle_reports_its_kind() {
         .expect("a subtrack");
     let s = w.track_at(i).unwrap();
     assert_eq!(
-        eval(&lua, &w, s, "x:kind()").unwrap(),
+        eval(&lua, &w, &s, "x:kind()").unwrap(),
         Plain::String("subtrack".into())
     );
     assert_eq!(s.family(), "track");
@@ -145,7 +145,7 @@ fn a_clip_id_handed_out_again_never_resolves_to_the_new_clip() {
     let content = w.content(content_id).unwrap();
     assert!(clip.is_valid(&w) && content.is_valid(&w));
     assert_eq!(
-        eval(&lua, &w, content, "x:kind()").unwrap(),
+        eval(&lua, &w, &content, "x:kind()").unwrap(),
         Plain::String("clip_content".into())
     );
     // Undo the creation, then create another clip: it gets the same ids.
@@ -161,12 +161,12 @@ fn a_clip_id_handed_out_again_never_resolves_to_the_new_clip() {
     let w2 = world(&d, &mut h);
     assert!(!clip.is_valid(&w2), "the old clip handle is expired");
     assert!(!content.is_valid(&w2), "the old content handle is expired");
-    expired(eval(&lua, &w2, clip, "x:check()"));
+    expired(eval(&lua, &w2, &clip, "x:check()"));
     let new_clip = w2.clip(again).unwrap();
     assert!(new_clip.is_valid(&w2));
     assert_ne!(new_clip.key(), clip.key());
     assert_eq!(
-        eval(&lua, &w2, new_clip, "x:valid()").unwrap(),
+        eval(&lua, &w2, &new_clip, "x:valid()").unwrap(),
         Plain::Boolean(true)
     );
     // A primary clip is its track's own content.
@@ -196,7 +196,7 @@ fn a_subchannel_id_taken_again_does_not_revive_the_old_handle() {
     let w2 = world(&d, &mut h);
     assert!(!s.is_valid(&w2));
     let lua = host();
-    expired(eval(&lua, &w2, s, "x:check()"));
+    expired(eval(&lua, &w2, &s, "x:check()"));
     assert!(w2.subchannel(t0, id).unwrap().is_valid(&w2));
 }
 
@@ -269,10 +269,10 @@ fn a_note_handle_survives_selection_but_expires_when_the_notes_change() {
     let w3 = world(&d, &mut h);
     assert!(!n.is_valid(&w3));
     let lua = host();
-    let e = expired(eval(&lua, &w3, n, "x:check()"));
+    let e = expired(eval(&lua, &w3, &n, "x:check()"));
     assert!(e.message.contains("note handle is expired"), "{e}");
     assert_eq!(
-        eval(&lua, &w3, n, "x:kind()").unwrap(),
+        eval(&lua, &w3, &n, "x:kind()").unwrap(),
         Plain::String("note".into())
     );
 }
@@ -306,7 +306,7 @@ fn an_event_handle_expires_when_the_events_change() {
     let w2 = world(&d, &mut h);
     assert!(!ev.is_valid(&w2));
     let lua = host();
-    expired(eval(&lua, &w2, ev, "x:check()"));
+    expired(eval(&lua, &w2, &ev, "x:check()"));
 }
 
 #[test]
@@ -321,11 +321,11 @@ fn handles_of_a_closed_project_are_expired_and_say_so() {
     h.reset(true);
     let w2 = world(&d, &mut h);
     assert_ne!(w2.project_serial(), w.project_serial());
-    for x in [t, p, c] {
+    for x in [t.clone(), p, c] {
         assert!(!x.is_valid(&w2));
     }
     let lua = host();
-    let e = expired(eval(&lua, &w2, t, "x:check()"));
+    let e = expired(eval(&lua, &w2, &t, "x:check()"));
     assert!(e.message.contains("no longer open"), "{e}");
     // No project at all.
     lua.set_world(None);
@@ -462,4 +462,60 @@ fn tick_values_that_would_lose_precision_are_refused() {
     assert!(ticks::to_lua(u64::MAX).is_err());
     assert!(ticks::to_lua(i64::MAX as u64 + 1).is_err());
     assert_eq!(ticks::to_lua(i64::MAX as u64).unwrap(), i64::MAX);
+}
+
+#[test]
+fn native_tool_content_owner_retains_identity_and_expires_when_track_context_disappears() {
+    use plumspirit_engine::editor::clips::{duplicate_clips, move_clips};
+    let (mut d, mut h) = project();
+    let op = add_clip(&d, 0, 100, 960).unwrap();
+    h.apply(&mut d, op).unwrap();
+    let content = d.clips().contents()[0].id;
+    let first = d.clips().placements_of(ContentRef::Owned(content))[0].id;
+    let op = duplicate_clips(&d, &[(first, 1, 2000)], true).unwrap();
+    h.apply(&mut d, op).unwrap();
+    let second = d.clips().placements_of(ContentRef::Owned(content))[1].id;
+    let t = d.track(1).unwrap().id();
+    let w = world(&d, &mut h);
+    let bound = w.content_on_track(content, t).unwrap();
+    let legacy = w.content(content).unwrap();
+    assert_eq!(bound, legacy);
+    assert_eq!(bound.key(), legacy.key());
+    let lua = host();
+    lua.set_world(Some(w.clone()));
+    assert_eq!(super::notes::host_of(&lua.lua, &bound).unwrap().track, t);
+    assert_eq!(
+        super::notes::host_of(&lua.lua, &legacy).unwrap().track,
+        d.track(0).unwrap().id()
+    );
+    let op = move_clips(&d, &[(second, 0, 3000)]).unwrap();
+    h.apply(&mut d, op).unwrap();
+    let moved = world(&d, &mut h);
+    assert!(!bound.is_valid(&moved));
+    assert!(legacy.is_valid(&moved));
+    assert!(moved.content_on_track(content, t).is_none());
+    expired(eval(&lua, &moved, &bound, "x:notes():count()"));
+    h.undo(&mut d).unwrap().unwrap();
+    let restored = world(&d, &mut h);
+    let before_delete = restored.content_on_track(content, t).unwrap();
+    h.apply(&mut d, Operation::DeleteTrack { index: 1 })
+        .unwrap();
+    assert!(!before_delete.is_valid(&world(&d, &mut h)));
+    h.undo(&mut d).unwrap().unwrap();
+    let reused = world(&d, &mut h);
+    assert!(
+        !before_delete.is_valid(&reused),
+        "same track id after Undo has another incarnation"
+    );
+    assert!(
+        reused
+            .content_on_track(content, t)
+            .unwrap()
+            .is_valid(&reused)
+    );
+    assert!(
+        reused
+            .content_on_track(content, plumspirit_engine::model::TrackId(u32::MAX))
+            .is_none()
+    );
 }

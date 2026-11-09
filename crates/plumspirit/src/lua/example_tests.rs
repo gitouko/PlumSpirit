@@ -131,6 +131,7 @@ fn tool_job(
 ) -> ToolJob {
     let decl = &m.plugin(GRAPH_SHIFT).unwrap().decls.tools[0];
     ToolJob {
+        stroke: None,
         tool: decl.id.clone(),
         params: params_literal(decl, values),
         track: doc.track(0).unwrap().id().0,
@@ -187,7 +188,7 @@ fn curve_of(values: &[ToolValue], i: usize) -> Curve {
 
 #[test]
 fn the_examples_are_valid_packages_for_this_api() {
-    assert_eq!(EXAMPLES.len(), 2);
+    assert_eq!(EXAMPLES.len(), 22);
     for ex in &EXAMPLES {
         let toml = ex
             .files
@@ -199,7 +200,67 @@ fn the_examples_are_valid_packages_for_this_api() {
         assert_eq!(m.id, ex.id);
         assert!(m.compatible().is_ok());
         assert_eq!(m.entry, "main.lua");
-        assert_eq!(m.capabilities, vec!["notes.edit", "project.read"]);
+        let expected = match ex.id {
+            "plumspirit.example.file-transform" => {
+                vec!["file.read_user_choice", "file.write_user_choice"]
+            }
+            "plumspirit.example.note-service" => vec!["services.provide"],
+            "plumspirit.example.service-composer" => {
+                vec!["notes.edit", "project.read", "services.call"]
+            }
+            "plumspirit.example.metadata-notebook" => vec!["metadata.edit", "project.read"],
+            "plumspirit.example.reactive-monitor" => vec!["project.observe", "project.read"],
+            "plumspirit.example.reactive-velocity" => vec![
+                "notes.edit",
+                "project.automate",
+                "project.observe",
+                "project.read",
+            ],
+            "plumspirit.example.font-resources" => {
+                vec!["file.read_user_choice", "fonts.list", "ui.panels"]
+            }
+            "plumspirit.example.midi-input-laboratory" => {
+                vec!["midi.input", "notes.edit", "project.read"]
+            }
+            "plumspirit.example.note-exchange" => vec![
+                "file.read_user_choice",
+                "file.write_user_choice",
+                "notes.edit",
+                "project.read",
+            ],
+            "plumspirit.example.text-art-studio" => {
+                vec!["fonts.list", "notes.edit", "project.read", "ui.panels"]
+            }
+            "plumspirit.example.image-art-studio" => vec![
+                "file.read_user_choice",
+                "notes.edit",
+                "project.read",
+                "ui.panels",
+            ],
+            "plumspirit.example.editor-overlay-laboratory" => {
+                vec![
+                    "file.read_user_choice",
+                    "playback.read",
+                    "project.read",
+                    "ui.overlay",
+                ]
+            }
+            "plumspirit.example.midi-pattern-laboratory" => {
+                vec!["playback.emit_midi", "playback.read"]
+            }
+            "plumspirit.example.transport-controls" => vec!["playback.control", "playback.read"],
+            "plumspirit.example.transport-monitor" => vec!["playback.read"],
+            "plumspirit.example.ui-layout-laboratory" => vec!["ui.panels"],
+            "plumspirit.example.ui-image-laboratory" => vec!["file.read_user_choice", "ui.panels"],
+            "plumspirit.example.custom-graph-laboratory" => {
+                vec!["notes.edit", "project.read", "ui.panels"]
+            }
+            "plumspirit.example.custom-drawing-studio" => {
+                vec!["notes.edit", "project.read", "tools.draw"]
+            }
+            _ => vec!["notes.edit", "project.read"],
+        };
+        assert_eq!(m.capabilities, expected);
         // The script compiles in the sandbox.
         let h = Host::new(Limits::default(), []).unwrap();
         h.run(
@@ -557,6 +618,7 @@ fn a_plugin_with_several_tools_and_a_command_runs_each_on_its_own() {
     assert_eq!(p.decls.commands.len(), 1);
     for (tool, key, g) in [("up", 61u8, 1u64), ("down", 59, 2)] {
         let job = ToolJob {
+            stroke: None,
             tool: tool.into(),
             params: "{}".into(),
             track: doc.track(0).unwrap().id().0,
@@ -674,4 +736,489 @@ fn peak_mb() -> u64 {
                 .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
         })
         .map_or(0, |kb| kb >> 10)
+}
+
+const IMAGE_STUDIO: &str = "plumspirit.example.image-art-studio";
+fn image_tool(
+    m: &mut PluginManager,
+    prefs: &PluginPrefs,
+    tool: usize,
+    values: &[ToolValue],
+    (preview, generation): (bool, u64),
+    doc: &Arc<PlumDocument>,
+    h: &mut History,
+) -> Result<Option<Commits>, String> {
+    let decl = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[tool].clone();
+    m.run_tool(
+        IMAGE_STUDIO,
+        ToolJob {
+            stroke: None,
+            tool: decl.id.clone(),
+            params: params_literal(&decl, values),
+            track: doc.track(0).unwrap().id().0,
+            content: None,
+            preview,
+            seed: 1,
+            keys: doc.project().keys.max_pitch() as u16 + 1,
+            generation,
+            world: Some(world(doc, h)),
+        },
+    )
+    .unwrap();
+    settle(m, prefs, &mut || world(doc, h))
+        .into_iter()
+        .find_map(|e| match e {
+            PluginEvent::ToolResult {
+                generation: g,
+                result,
+                ..
+            } if g == generation => Some(result),
+            _ => None,
+        })
+        .expect("image tool result")
+}
+fn image_events(
+    m: &mut PluginManager,
+    prefs: &PluginPrefs,
+    doc: &Arc<PlumDocument>,
+    h: &mut History,
+    choice: Option<PathBuf>,
+    close_panel: bool,
+) -> Vec<PluginEvent> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        for e in m.poll(prefs) {
+            if matches!(e, PluginEvent::NeedWorld) {
+                m.supply_world(world(doc, h));
+            }
+            out.push(e);
+        }
+        if let Some(request) = m.poll_ui_request() {
+            let stamp = request.lease.project;
+            request.respond(stamp, choice.clone()).unwrap();
+        }
+        if close_panel && let Some(panel) = m.poll_panel_request() {
+            let snapshot = panel.snapshot().expect("validated source frame");
+            assert_eq!(snapshot.title, "Image Art Studio — Captured Source");
+            assert!(panel.push(super::ui::Event {
+                kind: "activate",
+                id: "close".into(),
+                value: super::ui::InputValue::None,
+                pointer: None,
+                revision: panel.revision(),
+                sequence: 0
+            }));
+        }
+        if !m.is_busy() {
+            out.extend(m.poll(prefs));
+            return out;
+        }
+        assert!(Instant::now() < deadline, "image command did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+fn image_data(doc: &mut Arc<PlumDocument>, events: Vec<PluginEvent>) -> Option<String> {
+    let mut latest = None;
+    for e in events {
+        match e {
+            PluginEvent::ProjectData { plugin, text } => {
+                assert_eq!(plugin, IMAGE_STUDIO);
+                let data = &mut Arc::make_mut(doc).project_mut().plugin_data;
+                data.retain(|(id, _)| id != &plugin);
+                if !text.is_empty() {
+                    data.push((plugin, text.clone()));
+                }
+                latest = Some(text);
+            }
+            PluginEvent::Notice {
+                text, error: true, ..
+            } => panic!("image command error: {text}"),
+            _ => {}
+        }
+    }
+    latest
+}
+#[test]
+fn image_studio_installs_and_authored_artwork_has_deterministic_preview_apply_undo_both_key_modes()
+{
+    for keys in [128, 256] {
+        let (mut doc, mut h) = project(0, 60, 0);
+        if keys == 256 {
+            Arc::get_mut(&mut doc).unwrap().project_mut().keys =
+                plumspirit_engine::model::project::KeyRange::Extended256;
+        }
+        let (mut m, prefs, _root) =
+            with_example(&format!("image-art-{keys}"), IMAGE_STUDIO, &doc, &mut h);
+        let plugin = m.plugin(IMAGE_STUDIO).unwrap();
+        assert_eq!(plugin.decls.commands.len(), 5);
+        assert_eq!(plugin.decls.tools.len(), 2);
+        let mut values = plugin.decls.tools[0].defaults();
+        if keys == 256 {
+            values[1] = ToolValue::Int(200);
+        }
+        let preview = image_tool(&mut m, &prefs, 0, &values, (true, 1), &doc, &mut h)
+            .unwrap()
+            .unwrap();
+        assert!(preview.result().note_count() > 0 && preview.result().note_count() <= 4096);
+        let expected = preview.result().export_fingerprint();
+        let count = preview.result().note_count();
+        assert_eq!(doc.note_count(), 0);
+        drop(preview);
+        let mut apply = image_tool(&mut m, &prefs, 0, &values, (false, 2), &doc, &mut h)
+            .unwrap()
+            .unwrap();
+        assert_eq!(apply.result().export_fingerprint(), expected);
+        apply.apply(&mut h, &mut doc).unwrap();
+        drop(apply);
+        assert_eq!(doc.note_count(), count);
+        h.undo(Arc::get_mut(&mut doc).unwrap()).unwrap().unwrap();
+        assert_eq!(doc.note_count(), 0);
+        assert!(!h.can_undo());
+        h.redo(Arc::get_mut(&mut doc).unwrap()).unwrap().unwrap();
+        assert_eq!(doc.export_fingerprint(), expected);
+    }
+}
+#[test]
+fn image_studio_all_authored_mask_operations_run_as_installed_tools() {
+    for operation in 0..7 {
+        let (mut doc, mut h) = project(20, 60, 20);
+        let (mut m, prefs, _root) = with_example(
+            &format!("image-mask-{operation}"),
+            IMAGE_STUDIO,
+            &doc,
+            &mut h,
+        );
+        let decl = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[1].clone();
+        let mut values = decl.defaults();
+        values[1] = ToolValue::Int(60);
+        values[3] = ToolValue::Int(1);
+        values[9] = ToolValue::Choice(operation);
+        let before = doc.export_fingerprint();
+        let preview = image_tool(&mut m, &prefs, 1, &values, (true, 1), &doc, &mut h)
+            .unwrap()
+            .unwrap();
+        let expected = preview.result().export_fingerprint();
+        assert_eq!(doc.export_fingerprint(), before);
+        drop(preview);
+        let mut apply = image_tool(&mut m, &prefs, 1, &values, (false, 2), &doc, &mut h)
+            .unwrap()
+            .unwrap();
+        assert_eq!(apply.result().export_fingerprint(), expected);
+        apply.apply(&mut h, &mut doc).unwrap();
+        drop(apply);
+        assert_eq!(doc.export_fingerprint(), expected);
+        if operation != 6 && expected != before {
+            h.undo(Arc::get_mut(&mut doc).unwrap()).unwrap().unwrap();
+            assert_eq!(doc.export_fingerprint(), before);
+            h.redo(Arc::get_mut(&mut doc).unwrap()).unwrap().unwrap();
+            assert_eq!(doc.export_fingerprint(), expected);
+        }
+    }
+}
+#[test]
+fn image_studio_real_file_capture_cancel_source_preset_and_panel_use_bounded_plain_pixels() {
+    use image::{DynamicImage, ImageFormat, RgbaImage};
+    use std::io::Cursor;
+    let (mut doc, mut h) = project(0, 60, 0);
+    let (mut m, prefs, root) = with_example("image-capture", IMAGE_STUDIO, &doc, &mut h);
+    m.run_command(IMAGE_STUDIO, "choose_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, false);
+    assert!(image_data(&mut doc, events).is_none());
+    let raw = vec![
+        255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 10, 20, 30, 255,
+    ];
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(RgbaImage::from_raw(2, 2, raw).unwrap())
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    let path = root.join("captured-source.png");
+    std::fs::write(&path, bytes.into_inner()).unwrap();
+    m.run_command(IMAGE_STUDIO, "choose_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, Some(path.clone()), false);
+    let captured = image_data(&mut doc, events).unwrap();
+    assert!(captured.contains("ff0000ff00ff00800000ff000a141eff"));
+    assert!(!captured.contains("captured-source.png") && !captured.contains("file_token"));
+    m.run_command(IMAGE_STUDIO, "save_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, false);
+    image_data(&mut doc, events);
+    m.run_command(IMAGE_STUDIO, "reset_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, false);
+    let reset = image_data(&mut doc, events).unwrap();
+    assert!(!reset.contains("ff0000ff"));
+    std::fs::remove_file(&path).unwrap(); // Future tools/presets must not reopen the source.
+    m.run_command(IMAGE_STUDIO, "load_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, false);
+    assert_eq!(image_data(&mut doc, events).unwrap(), captured);
+    let values = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[0].defaults();
+    assert!(
+        image_tool(&mut m, &prefs, 0, &values, (true, 7), &doc, &mut h)
+            .unwrap()
+            .unwrap()
+            .result()
+            .note_count()
+            > 0
+    );
+    m.run_command(IMAGE_STUDIO, "show_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, true);
+    assert!(image_data(&mut doc, events).is_none());
+    assert_eq!(doc.note_count(), 0);
+}
+
+#[test]
+fn image_studio_bounds_capture_and_refuses_malformed_pixels_then_recovers() {
+    use image::{DynamicImage, ImageFormat, RgbaImage};
+    use std::io::Cursor;
+    let (mut doc, mut h) = project(0, 60, 0);
+    let (mut m, prefs, root) = with_example("image-bounded-capture", IMAGE_STUDIO, &doc, &mut h);
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(RgbaImage::from_raw(128, 128, vec![255; 128 * 128 * 4]).unwrap())
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    let path = root.join("large-capture.png");
+    std::fs::write(&path, png.into_inner()).unwrap();
+    m.run_command(IMAGE_STUDIO, "choose_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, Some(path), false);
+    let data = image_data(&mut doc, events).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+    let capture = &json["values"]["image_art_capture"];
+    assert_eq!(capture["width"], 64);
+    assert_eq!(capture["height"], 64);
+    assert_eq!(capture["hex"].as_str().unwrap().len(), 32768);
+    let mut values = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[0].defaults();
+    values[1] = ToolValue::Int(0);
+    values[2] = ToolValue::Int(64);
+    values[3] = ToolValue::Int(64);
+    values[8] = ToolValue::Bool(true);
+    assert_eq!(
+        image_tool(&mut m, &prefs, 0, &values, (true, 1), &doc, &mut h)
+            .unwrap()
+            .unwrap()
+            .result()
+            .note_count(),
+        4096
+    );
+    Arc::make_mut(&mut doc).project_mut().plugin_data=vec![(IMAGE_STUDIO.into(),"{\"version\":1,\"values\":{\"image_art_capture\":{\"version\":1,\"width\":64,\"height\":64,\"hex\":\"00\"}}}".into())];
+    assert!(image_tool(&mut m, &prefs, 0, &values, (true, 2), &doc, &mut h).is_err());
+    assert_eq!(doc.note_count(), 0);
+    m.run_command(IMAGE_STUDIO, "reset_source", Some(world(&doc, &mut h)))
+        .unwrap();
+    let events = image_events(&mut m, &prefs, &doc, &mut h, None, false);
+    image_data(&mut doc, events);
+    assert!(
+        image_tool(&mut m, &prefs, 0, &values, (true, 3), &doc, &mut h)
+            .unwrap()
+            .is_some()
+    );
+}
+#[test]
+fn image_studio_installed_art_and_mask_keep_owned_linked_clip_local_target() {
+    let (mut doc, mut h) = project(0, 60, 0);
+    Arc::get_mut(&mut doc).unwrap().project_mut().keys =
+        plumspirit_engine::model::project::KeyRange::Extended256;
+    let setup = Host::new(
+        Limits::default(),
+        [
+            Capability::ReadProject,
+            Capability::EditNotes,
+            Capability::EditTracks,
+        ],
+    )
+    .unwrap();
+    setup.set_world(Some(world(&doc, &mut h)));
+    setup.run("image-clip-fixture.lua","local t=plum.project.current():track(1);local tx=plum.transaction{};local child=tx:add_subtracks(t,1)[1];local c=tx:add_clip(child,10000,1000);tx:duplicate_clips(c,{start=20000,linked=true});tx:insert_notes(c:content(),{{start=1,gate=2,key=200,velocity=70}});tx:commit()").unwrap();
+    let mut prepared = setup.take_commits().unwrap();
+    setup.set_world(None);
+    prepared.apply(&mut h, &mut doc).unwrap();
+    drop(prepared);
+    h.reset(false);
+    let content = doc.clips().contents().first().unwrap().id;
+    let track = doc.track(1).unwrap().id().0;
+    let (mut m, prefs, _root) = with_example("image-owned-clips", IMAGE_STUDIO, &doc, &mut h);
+    let mut values = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[0].defaults();
+    values[1] = ToolValue::Int(200);
+    let decl = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[0].clone();
+    m.run_tool(
+        IMAGE_STUDIO,
+        ToolJob {
+            stroke: None,
+            tool: decl.id.clone(),
+            params: params_literal(&decl, &values),
+            track,
+            content: Some(content.0),
+            preview: true,
+            seed: 1,
+            keys: 256,
+            generation: 1,
+            world: Some(world(&doc, &mut h)),
+        },
+    )
+    .unwrap();
+    let preview = settle(&mut m, &prefs, &mut || world(&doc, &mut h))
+        .into_iter()
+        .find_map(|e| match e {
+            PluginEvent::ToolResult { result, .. } => Some(result.unwrap().unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        preview
+            .result()
+            .notes_of(plumspirit_engine::model::ContentRef::Owned(content))
+            .unwrap()
+            .len()
+            > 1
+    );
+    assert_eq!(preview.result().track(0).unwrap().notes.len(), 0);
+    assert_eq!(preview.result().track(1).unwrap().notes.len(), 0);
+    drop(preview);
+    assert_eq!(doc.stored_note_count(), 1);
+    let decl = m.plugin(IMAGE_STUDIO).unwrap().decls.tools[1].clone();
+    let mut values = decl.defaults();
+    values[1] = ToolValue::Int(200);
+    values[3] = ToolValue::Int(1);
+    m.run_tool(
+        IMAGE_STUDIO,
+        ToolJob {
+            stroke: None,
+            tool: decl.id.clone(),
+            params: params_literal(&decl, &values),
+            track,
+            content: Some(content.0),
+            preview: true,
+            seed: 1,
+            keys: 256,
+            generation: 2,
+            world: Some(world(&doc, &mut h)),
+        },
+    )
+    .unwrap();
+    let mut commits = settle(&mut m, &prefs, &mut || world(&doc, &mut h))
+        .into_iter()
+        .find_map(|e| match e {
+            PluginEvent::ToolResult { result, .. } => Some(result.unwrap().unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    let rec = commits
+        .result()
+        .notes_of(plumspirit_engine::model::ContentRef::Owned(content))
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .record();
+    assert_eq!({ rec.start_tick }, 1);
+    assert_eq!(rec.attrs.pitch(), 200);
+    assert_eq!(rec.attrs.velocity(), 100);
+    commits.apply(&mut h, &mut doc).unwrap();
+    drop(commits);
+    assert_eq!(doc.clips().explicit_placements().len(), 2);
+    h.undo(Arc::get_mut(&mut doc).unwrap()).unwrap().unwrap();
+    assert_eq!(
+        doc.clips()
+            .content(content)
+            .unwrap()
+            .notes
+            .iter()
+            .next()
+            .unwrap()
+            .attrs
+            .velocity(),
+        70
+    );
+}
+
+#[path = "midi_input_laboratory_tests.rs"]
+mod midi_input_laboratory;
+#[path = "text_art_studio_tests.rs"]
+mod text_art_studio;
+
+#[test]
+fn catalogue_keeps_original_order_and_installs_every_owned_package_file_exactly() {
+    let original = [
+        "plumspirit.example.graph-shift",
+        "plumspirit.example.cc-batch",
+        "plumspirit.example.custom-graph-laboratory",
+        "plumspirit.example.custom-drawing-studio",
+        "plumspirit.example.ui-layout-laboratory",
+        "plumspirit.example.ui-image-laboratory",
+        "plumspirit.example.transport-monitor",
+        "plumspirit.example.transport-controls",
+        "plumspirit.example.midi-pattern-laboratory",
+        "plumspirit.example.editor-overlay-laboratory",
+        "plumspirit.example.image-art-studio",
+        "plumspirit.example.text-art-studio",
+        "plumspirit.example.note-exchange",
+        "plumspirit.example.midi-input-laboratory",
+        "plumspirit.example.font-resources",
+    ];
+    assert_eq!(
+        EXAMPLES[..15].iter().map(|e| e.id).collect::<Vec<_>>(),
+        original
+    );
+    let sources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples-lua");
+    let mut packages = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&sources).unwrap() {
+        let folder = entry.unwrap().path();
+        let manifest = folder.join(package::MANIFEST);
+        if !manifest.is_file() {
+            continue;
+        }
+        let m = Manifest::parse(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+        assert!(packages.insert(m.id, folder).is_none());
+    }
+    assert_eq!(
+        packages.len(),
+        EXAMPLES.len(),
+        "Every authored sample must ship through the native installer"
+    );
+    let root = temp("catalogue");
+    for ex in &EXAMPLES {
+        let folder = packages
+            .remove(ex.id)
+            .expect("An embedded sample must have canonical source");
+        let installed = ex.write_to(&root).unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        for (name, contents) in ex.files {
+            assert!(names.insert(*name));
+            assert_eq!(
+                std::fs::read(folder.join(name)).unwrap(),
+                contents.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(installed.join(name)).unwrap(),
+                contents.as_bytes()
+            );
+        }
+        let source_names = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            source_names,
+            names.into_iter().map(str::to_owned).collect(),
+            "No missing helper, manifest or README in {}",
+            ex.id
+        );
+    }
+    assert!(packages.is_empty());
+    let resolved = root.canonicalize().unwrap();
+    let base = std::env::temp_dir().canonicalize().unwrap();
+    assert_eq!(resolved.parent(), Some(base.as_path()));
+    assert!(
+        resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("plumspirit-example-test-catalogue-")
+    );
+    std::fs::remove_dir_all(resolved).unwrap();
 }

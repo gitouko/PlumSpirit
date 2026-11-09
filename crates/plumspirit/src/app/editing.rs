@@ -6,7 +6,7 @@ use super::{PlumSpiritApp, jobs};
 use crate::diagnostics::format_duration;
 use crate::piano_roll::RollAction;
 use crate::ui::status_bar::StatusKind;
-use plumspirit_engine::editor::{self, Clipboard, EditControl, ExactFactor, PreparedEdit};
+use plumspirit_engine::editor::{self, EditControl, ExactFactor, PreparedEdit};
 use plumspirit_engine::history::{HistoryError, Operation, Outcome};
 use plumspirit_engine::midi::group_digits;
 use plumspirit_engine::model::{Bpm, NoteRecord};
@@ -162,6 +162,7 @@ impl PlumSpiritApp {
         let Some(o) = self.open.as_mut() else {
             return;
         };
+        let previous_revision = o.history.current_state();
         let Some(doc) = Arc::get_mut(&mut o.doc) else {
             return;
         };
@@ -181,6 +182,11 @@ impl PlumSpiritApp {
                 }
                 self.set_status(format!("Undid {}.", a.label), StatusKind::Info);
                 self.restore_clip_selection();
+                self.lua_automation.block(self.lua_observation_stamp());
+                self.publish_lua_observation(
+                    crate::lua::reactive::Kind::Undo,
+                    crate::lua::reactive::Data::History { previous_revision },
+                );
             }
             Ok(None) => {}
             Err(e) => self.show_error("Undo failed.", e.user_message()),
@@ -193,6 +199,7 @@ impl PlumSpiritApp {
         let Some(o) = self.open.as_mut() else {
             return;
         };
+        let previous_revision = o.history.current_state();
         let Some(doc) = Arc::get_mut(&mut o.doc) else {
             return;
         };
@@ -212,6 +219,11 @@ impl PlumSpiritApp {
                 }
                 self.set_status(format!("Redid {}.", a.label), StatusKind::Info);
                 self.restore_clip_selection();
+                self.lua_automation.block(self.lua_observation_stamp());
+                self.publish_lua_observation(
+                    crate::lua::reactive::Kind::Redo,
+                    crate::lua::reactive::Data::History { previous_revision },
+                );
             }
             Ok(None) => {}
             Err(e) => self.show_error("Redo failed.", e.user_message()),
@@ -406,61 +418,26 @@ impl PlumSpiritApp {
             .map_err(|e| e.user_message())
     }
 
-    pub(super) fn copy(&mut self) {
+    pub(super) fn copy(&mut self) -> bool {
         let hosts = self.aggregate_hosts();
-        let Some(d) = self.doc() else {
-            return;
+        let Some(doc) = self.doc() else {
+            return false;
         };
-        // B2-F18: in Track Aggregate the selected notes of every clip, at
-        // their distances in the song.
-        let copied = if hosts.len() > 1 {
-            let mut parts = Vec::new();
-            let mut fail = None;
-            let mut seen = Vec::new();
-            for h in &hosts {
-                // Linked instances share their notes: copied once (B2-S12).
-                if seen.contains(&h.target) {
-                    continue;
-                }
-                seen.push(h.target);
-                let Ok(t) = editor::note_view(d, h.target) else {
-                    continue;
-                };
-                let Some(b) = t.notes.selection_bounds() else {
-                    continue;
-                };
-                match Clipboard::copy_selected_with_groups(t, &d.project().groups) {
-                    Ok(Some(c)) => {
-                        parts.push((c, crate::app::clip_session::shifted(b.min_start, h.shift)))
-                    }
-                    Ok(None) => {}
-                    Err(e) => fail = Some(e),
-                }
-            }
-            match (fail, parts.iter().map(|p| p.1).min()) {
-                (Some(e), _) => Err(e),
-                (None, None) => Ok(None),
-                (None, Some(first)) => Ok(Some(Clipboard::combine(
-                    parts.into_iter().map(|(c, at)| (c, at - first)).collect(),
-                ))),
-            }
-        } else {
-            let Ok(t) = editor::note_view(d, self.edit_target()) else {
-                return;
-            };
-            Clipboard::copy_selected_with_groups(t, &d.project().groups)
-        };
-        match copied {
-            Ok(Some(c)) => {
-                let n = c.len();
-                self.clipboard = Some(c);
+        match super::musical_clipboard::snapshot_notes(doc, &hosts) {
+            Ok(Some((_, clip))) => {
+                let n = clip.len();
+                self.clipboard = Some(clip);
                 self.set_status(
                     format!("Copied {} note(s).", group_digits(n as u64)),
                     StatusKind::Info,
                 );
+                true
             }
-            Ok(None) => {}
-            Err(e) => self.show_error("Copy failed.", e.user_message()),
+            Ok(None) => false,
+            Err(e) => {
+                self.show_error("Copy failed.", e.user_message());
+                false
+            }
         }
     }
 
@@ -490,31 +467,7 @@ impl PlumSpiritApp {
                 return;
             };
             match clip.prepare_paste_grouped(d, ti, at) {
-                Ok((edit, table)) => {
-                    let op = Operation::Group {
-                        ops: vec![
-                            Operation::SetGroups {
-                                table: Box::new(table),
-                                label: "Paste",
-                            },
-                            Operation::Prepared {
-                                edit,
-                                label: "Paste",
-                            },
-                        ],
-                        label: "Paste",
-                    };
-                    if self.apply_op(op).is_some() {
-                        self.set_status(
-                            format!(
-                                "Pasted {} note(s) at tick {} into new groups.",
-                                group_digits(n as u64),
-                                group_digits(at_song)
-                            ),
-                            StatusKind::Info,
-                        );
-                    }
-                }
+                Ok((edit, table)) => self.apply_grouped_paste(edit, table, at_song),
                 Err(e) => self.show_error("Paste was not applied.", e.user_message()),
             }
             return;
@@ -540,6 +493,38 @@ impl PlumSpiritApp {
                 }
             }
             Err(e) => self.show_error("Paste was not applied.", e.user_message()),
+        }
+    }
+
+    pub(super) fn apply_grouped_paste(
+        &mut self,
+        edit: PreparedEdit,
+        table: plumspirit_engine::model::GroupTable,
+        at_song: u64,
+    ) {
+        let n = edit.affected_notes();
+        let op = Operation::Group {
+            ops: vec![
+                Operation::SetGroups {
+                    table: Box::new(table),
+                    label: "Paste",
+                },
+                Operation::Prepared {
+                    edit,
+                    label: "Paste",
+                },
+            ],
+            label: "Paste",
+        };
+        if self.apply_op(op).is_some() {
+            self.set_status(
+                format!(
+                    "Pasted {} note(s) at tick {} into new groups.",
+                    group_digits(n as u64),
+                    group_digits(at_song)
+                ),
+                StatusKind::Info,
+            );
         }
     }
 
@@ -819,7 +804,7 @@ impl PlumSpiritApp {
                         );
                     }
                 }
-                RollAction::Seek(tick) => self.seek_to(tick),
+                RollAction::Seek(tick) => self.seek_from_roll(tick),
                 RollAction::SetTimeSelection(r) => self.set_time_selection(r),
                 RollAction::LoopTimeSelection => self.loop_to_selection(),
                 RollAction::SelectInTimeSelection => {
@@ -836,6 +821,7 @@ impl PlumSpiritApp {
                 RollAction::ScaleBox { from, to, fill } => self.commit_scale_box(from, to, fill),
                 RollAction::WarpBox { from, warp, fill } => self.commit_warp_box(from, warp, fill),
                 RollAction::Stroke { points, done } => self.tool_stroke(&points, done, ctx),
+                RollAction::StrokeCanceled => self.cancel_custom_stroke(),
                 RollAction::StrokeVertex(t, p) => self.tool_vertex(t, p),
                 a @ (RollAction::MoveMarker { .. }
                 | RollAction::EditMarker(_)

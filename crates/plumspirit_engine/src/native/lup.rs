@@ -100,6 +100,7 @@ const TAG_SOURCE: [u8; 4] = *b"PROV";
 const TAG_ONION_TRACKS: [u8; 4] = *b"ONPT";
 /// v1.0-beta1 (B1-0035): per-project Lua plugin data (optional; older
 /// versions keep it unread).
+const TAG_METADATA: [u8; 4] = *b"XMDA";
 const TAG_PLUGIN_DATA: [u8; 4] = *b"PLUG";
 /// Most plugins with project data, and the largest data of one.
 pub const MAX_PLUGIN_DATA_ENTRIES: usize = 4096;
@@ -874,6 +875,10 @@ pub(crate) fn write_project_threads<W: Write + Seek>(
 ) -> Result<LupWriteStats, LupError> {
     let wr = |e: io::Error| LupError::io(Some(SaveStage::Write), e);
     let project = doc.project();
+    project
+        .metadata
+        .validate_targets(doc)
+        .map_err(|m| LupError::malformed(0, m))?;
     let has_extra = !doc.extra_chunks().is_empty();
     let has_groups = project.groups.entries().iter().any(|g| !g.temporary);
     let folders = saved_folders(doc);
@@ -890,6 +895,7 @@ pub(crate) fn write_project_threads<W: Write + Seek>(
         + usize::from(project.source.is_some())
         + usize::from(project.reference.is_some())
         + usize::from(!project.plugin_data.is_empty())
+        + usize::from(!project.metadata.is_empty())
         + usize::from(folders.is_some())
         + usize::from(onion_tracks_used(&project.onion))
         + project.unknown_sections.len();
@@ -1061,6 +1067,18 @@ pub(crate) fn write_project_threads<W: Write + Seek>(
         s.uv(p.size);
         s.uv(p.hash);
         s.uv(p.fingerprint);
+        stats.bytes += s.finish().map_err(wr)?;
+    }
+
+    // XMDA: API02 typed transaction metadata, optional and MIDI-independent.
+    if !project.metadata.is_empty() {
+        let bytes = project
+            .metadata
+            .encode()
+            .map_err(|m| LupError::malformed(0, m))?;
+        let mut s = SectionWriter::begin(w, TAG_METADATA, 0).map_err(wr)?;
+        s.uv(1);
+        s.string(&bytes).map_err(wr)?;
         stats.bytes += s.finish().map_err(wr)?;
     }
 
@@ -1354,6 +1372,7 @@ fn section_label(tag: [u8; 4]) -> String {
         TAG_TRACK_LIST => "Track List view".into(),
         TAG_SOURCE => "MIDI source".into(),
         TAG_PLUGIN_DATA => "plugin data".into(),
+        TAG_METADATA => "typed metadata".into(),
         TAG_ONION_TRACKS => "per-track Onion Skin settings".into(),
         other => format!("\"{}\"", tag_name(other)),
     }
@@ -1439,6 +1458,7 @@ trait Sink {
     fn unknown(&mut self, u: UnknownSection, at: u64) -> Result<(), LupError>;
     /// v1.0-beta1 `PLUG`: (plugin id, data) sorted by id.
     fn plugin_data(&mut self, v: Vec<(String, String)>, at: u64) -> Result<(), LupError>;
+    fn metadata(&mut self, v: crate::model::metadata::Metadata, at: u64) -> Result<(), LupError>;
     /// v0.9 `CLIP`: the placement records; the owned contents follow, each
     /// as `begin_content`, `notes` / `begin_events` / `event`, `end_content`.
     fn clips(&mut self, head: ParsedClips, at: u64) -> Result<(), LupError>;
@@ -1841,6 +1861,7 @@ impl Parser<'_> {
         let mut saw_source = false;
         let mut saw_reference = false;
         let mut saw_plugin_data = false;
+        let mut saw_metadata = false;
         let mut saw_folders = false;
         let mut saw_clips = false;
         for _ in 0..sections {
@@ -2128,6 +2149,27 @@ impl Parser<'_> {
                         // A newer layout: this version offers no strict export.
                         sr.skip_rest()?;
                     }
+                }
+                TAG_METADATA => {
+                    let at = sr.offset();
+                    if saw_metadata {
+                        return Err(LupError::malformed(at, "duplicate typed metadata"));
+                    }
+                    saw_metadata = true;
+                    if sr.uv()? != 1 {
+                        return Err(LupError::malformed(at, "unsupported typed metadata layout"));
+                    }
+                    let n = sr.uv()?;
+                    if n > crate::model::metadata::MAX_BYTES as u64 {
+                        return Err(LupError::malformed(at, "typed metadata exceeds1MiB"));
+                    }
+                    sr.bytes_into(n, &mut scratch)?;
+                    let v = crate::model::metadata::Metadata::decode(&scratch)
+                        .map_err(|m| LupError::malformed(at, m))?;
+                    if v.is_empty() {
+                        return Err(LupError::malformed(at, "empty typed metadata section"));
+                    }
+                    sink.metadata(v, at)?;
                 }
                 TAG_PLUGIN_DATA if version >= 5 => {
                     let at = sr.offset();
@@ -3481,6 +3523,11 @@ impl Sink for Builder {
         Ok(())
     }
 
+    fn metadata(&mut self, v: crate::model::metadata::Metadata, _at: u64) -> Result<(), LupError> {
+        self.project.metadata = v;
+        Ok(())
+    }
+
     fn plugin_data(&mut self, v: Vec<(String, String)>, _at: u64) -> Result<(), LupError> {
         self.project.plugin_data = v;
         Ok(())
@@ -3633,6 +3680,10 @@ pub(crate) fn read_project_threads<R: Read>(
         .map_err(bad)?;
         doc.validate_clips().map_err(bad)?;
     }
+    doc.project()
+        .metadata
+        .validate_targets(&doc)
+        .map_err(|m| LupError::malformed(0, m))?;
     let mut report = parser.report;
     if !legacy && report.version < LUP_VERSION {
         report.migrated_from = Some(report.version);
@@ -3713,6 +3764,7 @@ struct Verifier<'d> {
     transport_seen: bool,
     reference_seen: bool,
     plugin_data_seen: bool,
+    metadata_seen: bool,
     folders_seen: bool,
     track_list_seen: bool,
     source_seen: bool,
@@ -3738,6 +3790,7 @@ impl<'d> Verifier<'d> {
             transport_seen: false,
             reference_seen: false,
             plugin_data_seen: false,
+            metadata_seen: false,
             folders_seen: false,
             track_list_seen: false,
             source_seen: false,
@@ -4008,6 +4061,14 @@ impl<'d> Sink for Verifier<'d> {
         Ok(())
     }
 
+    fn metadata(&mut self, v: crate::model::metadata::Metadata, at: u64) -> Result<(), LupError> {
+        self.metadata_seen = true;
+        if v != self.doc.project().metadata {
+            return Err(self.fail(at, "typed metadata differs"));
+        }
+        Ok(())
+    }
+
     fn plugin_data(&mut self, v: Vec<(String, String)>, at: u64) -> Result<(), LupError> {
         self.plugin_data_seen = true;
         if v != self.doc.project().plugin_data {
@@ -4135,6 +4196,7 @@ pub(crate) fn verify_project_threads<R: Read>(
         || !v.transport_seen
         || v.reference_seen != doc.project().reference.is_some()
         || v.plugin_data_seen == doc.project().plugin_data.is_empty()
+        || v.metadata_seen == doc.project().metadata.is_empty()
         || v.folders_seen == doc.project().folders.is_empty()
         || v.track_list_seen != doc.project().track_list.is_some()
         || v.source_seen != doc.project().source.is_some()

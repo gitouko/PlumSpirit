@@ -1099,7 +1099,7 @@ impl PlumSpiritApp {
         }
     }
 
-    fn snap_ticks(&self) -> u64 {
+    pub(super) fn snap_ticks(&self) -> u64 {
         let Some(div) = self.doc().map(|d| d.division()) else {
             return 240;
         };
@@ -1324,6 +1324,10 @@ impl PlumSpiritApp {
         done: bool,
         ctx: &egui::Context,
     ) {
+        if self.custom_tool.as_ref().is_some_and(|s| s.decl.freehand) {
+            self.custom_stroke(points, done, ctx);
+            return;
+        }
         let Some(s) = self.tool.as_mut() else {
             return;
         };
@@ -1792,7 +1796,7 @@ impl PlumSpiritApp {
                 ui.separator();
                 if let Some(mode) = s.capture_mode() {
                     let hint = match mode {
-                        crate::piano_roll::CaptureMode::Freehand => {
+                        crate::piano_roll::CaptureMode::Freehand | crate::piano_roll::CaptureMode::FreehandOrdered => {
                             "Drag in the Piano Roll to draw (the window stays open)."
                         }
                         crate::piano_roll::CaptureMode::Polygon => {

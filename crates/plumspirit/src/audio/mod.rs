@@ -25,6 +25,7 @@
 mod delivery_analysis;
 pub mod engine;
 pub mod midi_out;
+pub mod midi_overlay;
 pub mod output;
 #[cfg(test)]
 pub mod profile;
@@ -200,6 +201,9 @@ struct Loader {
 }
 
 pub struct Transport {
+    midi_overlay: Option<midi_overlay::Watch>,
+    // Native action generation for safely rejecting stale extension requests.
+    action_revision: u64,
     state: TransportState,
     /// Musical position (ticks) while not playing; the start point while playing.
     position: u64,
@@ -326,6 +330,8 @@ const OPEN_WAIT: Duration = Duration::from_millis(100);
 impl Default for Transport {
     fn default() -> Self {
         Transport {
+            midi_overlay: None,
+            action_revision: 0,
             state: TransportState::Stopped,
             position: 0,
             generation: 1,
@@ -370,6 +376,117 @@ impl Default for Transport {
 }
 
 impl Transport {
+    pub fn midi_resources(&self) -> Option<midi_overlay::Resources> {
+        if !self.state.is_running() || self.render.0 {
+            return None;
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .filter(|e| e.worker_alive() && !e.shared.device_failed.load(Ordering::Acquire))?;
+        let (_, tempo) = self.tempo.as_ref()?;
+        if tempo.sample_rate() != engine.sample_rate {
+            return None;
+        }
+        Some(midi_overlay::Resources {
+            tempo: Arc::clone(tempo),
+            font: Arc::clone(&self.soundfont.as_ref()?.font),
+            sample_rate: engine.sample_rate,
+        })
+    }
+    pub fn midi_status(&self) -> midi_overlay::Status {
+        self.midi_overlay
+            .as_ref()
+            .map_or(midi_overlay::Status::Idle, |w| w.status())
+    }
+    pub fn midi_watch(&self) -> Option<&midi_overlay::Watch> {
+        self.midi_overlay.as_ref()
+    }
+    pub fn midi_pending(&self) -> u32 {
+        self.midi_overlay
+            .as_ref()
+            .map_or(0, |w| w.pending.load(Ordering::Acquire))
+    }
+    pub fn cancel_plugin_midi(&mut self) {
+        if let Some(w) = self
+            .midi_overlay
+            .as_ref()
+            .filter(|w| w.alive.load(Ordering::Acquire))
+        {
+            w.cancel();
+        }
+    }
+    pub fn submit_plugin_midi(
+        &mut self,
+        voice: Box<midi_overlay::PreparedVoice>,
+        owner: Arc<str>,
+        project: (u64, u64),
+        plugin: Arc<std::sync::atomic::AtomicBool>,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+        version: u64,
+    ) -> Result<(), &'static str> {
+        if self
+            .midi_overlay
+            .as_ref()
+            .is_some_and(|w| w.alive.load(Ordering::Acquire))
+        {
+            return Err("Another plugin MIDI stream is active.");
+        }
+        if self.midi_resources().is_none() {
+            return Err(
+                "MIDI output requires running native internal playback with a SoundFont and without Pre-Render.",
+            );
+        }
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let pending = Arc::new(std::sync::atomic::AtomicU32::new(voice.count()));
+        let status = Arc::new(std::sync::atomic::AtomicU8::new(
+            midi_overlay::Status::Queued as u8,
+        ));
+        let life = midi_overlay::Life {
+            alive: Arc::clone(&alive),
+            status: Arc::clone(&status),
+            pending: Arc::clone(&pending),
+            plugin,
+            epoch,
+            version,
+        };
+        let sent = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.send(Command::PluginMidi { voice, life }));
+        self.midi_overlay = Some(midi_overlay::Watch {
+            owner,
+            project,
+            alive,
+            status,
+            pending,
+        });
+        if !sent {
+            let watch = self.midi_overlay.as_ref().expect("set watch");
+            watch
+                .status
+                .store(midi_overlay::Status::Refused as u8, Ordering::Release);
+            watch.alive.store(false, Ordering::Release);
+            return Err("The native audio command queue is busy or unavailable.");
+        }
+        Ok(())
+    }
+    pub fn action_revision(&self) -> u64 {
+        self.action_revision
+    }
+    fn action_changed(&mut self) {
+        self.cancel_plugin_midi();
+        self.action_revision = self.action_revision.saturating_add(1);
+    }
+
+    pub fn speed(&self) -> Speed {
+        self.speed
+    }
+
+    pub fn loop_range(&self) -> Option<(u64, u64)> {
+        self.looping
+    }
+
     pub fn state(&self) -> TransportState {
         self.state
     }
@@ -691,6 +808,7 @@ impl Transport {
         if self.speed == speed {
             return None;
         }
+        self.action_changed();
         self.speed = speed;
         if let Some(r) = &self.reference {
             let (a, o, g) = (r.audio.clone(), r.offset, r.gain);
@@ -709,6 +827,7 @@ impl Transport {
         if self.looping == range {
             return;
         }
+        self.action_changed();
         self.looping = range;
         if self.state.is_running()
             && let Some(e) = &self.engine
@@ -723,6 +842,7 @@ impl Transport {
         if self.loader.as_ref().is_some_and(|l| l.path == path) {
             return;
         }
+        self.action_changed();
         if let Some(old) = self.loader.take()
             && let Some(h) = old.handle
         {
@@ -768,6 +888,9 @@ impl Transport {
     /// Output device / sample rate / buffer (applied by a new engine: at
     /// once while stopped, else at the next Play).
     pub fn configure_output(&mut self, cfg: output::OutputConfig) {
+        if self.output != cfg {
+            self.action_changed();
+        }
         self.output = cfg;
         if !self.state.is_running() && self.auditions_held.is_empty() {
             self.release_stale_engine();
@@ -964,6 +1087,7 @@ impl Transport {
     /// place, else from the current position (from the start when at or past
     /// the end).
     pub fn play(&mut self, doc: &PlumDocument, doc_generation: u64) -> Option<TransportEvent> {
+        self.action_changed();
         if self.policy.anchor && self.paused_at != Some(self.position) {
             self.position = self.anchor;
         }
@@ -1076,6 +1200,7 @@ impl Transport {
 
     /// Pauses, keeping the position that was last heard.
     pub fn pause(&mut self) {
+        self.action_changed();
         if !self.state.is_running() {
             self.play_when_ready = false;
             if self.state == TransportState::Seeking {
@@ -1102,6 +1227,7 @@ impl Transport {
     /// the anchor — the Edit playhead, or where this playback started. The
     /// anchor itself never moves.
     pub fn stop(&mut self) {
+        self.action_changed();
         self.pause();
         self.play_when_ready = false;
         self.position = self.anchor;
@@ -1115,6 +1241,7 @@ impl Transport {
     /// B1-0103 (Change PPQN, Preserve beats): every tick the transport
     /// holds follows the rescaled project. Called while stopped.
     pub fn rescale_ticks(&mut self, f: impl Fn(u64) -> u64) {
+        self.action_changed();
         self.position = f(self.position);
         self.last_playhead = f(self.last_playhead);
         self.paused_at = self.paused_at.map(&f);
@@ -1133,6 +1260,9 @@ impl Transport {
 
     /// Turning the anchor on places it at the current position.
     pub fn set_playhead_policy(&mut self, policy: PlayheadPolicy) {
+        if self.policy != policy {
+            self.action_changed();
+        }
         if policy.anchor && !self.policy.anchor {
             self.anchor = if self.state.is_running() {
                 self.position
@@ -1159,6 +1289,7 @@ impl Transport {
         doc: &PlumDocument,
         doc_generation: u64,
     ) -> Option<TransportEvent> {
+        self.action_changed();
         self.position = tick;
         self.last_playhead = tick;
         self.paused_at = None;
@@ -1181,6 +1312,7 @@ impl Transport {
         if self.default_output == target {
             return;
         }
+        self.action_changed();
         self.default_output = target;
         self.default_error = None;
         self.routes_key = self.routes_key.wrapping_add(1);
@@ -1228,6 +1360,7 @@ impl Transport {
     /// Stops and forgets per-document caches (a different project was opened or
     /// created). Keeps the device and SoundFont.
     pub fn reset_for_new_document(&mut self) {
+        self.action_changed();
         self.audition_all_off();
         if let Some(e) = &self.engine {
             e.send(Command::Pause);
@@ -1634,7 +1767,7 @@ impl Transport {
 
     /// A transport wired to an already running (test) engine and SoundFont.
     #[cfg(test)]
-    fn for_test(engine: AudioEngine, soundfont: LoadedSoundFont) -> Transport {
+    pub(crate) fn for_test(engine: AudioEngine, soundfont: LoadedSoundFont) -> Transport {
         engine.send(Command::SetSoundFont(Arc::clone(&soundfont.font)));
         Transport {
             engine: Some(engine),

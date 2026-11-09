@@ -39,27 +39,16 @@ pub fn decode(path: &Path) -> Result<Rgba, String> {
     if len > MAX_FILE_BYTES {
         return Err("The picture file is larger than 512 MB.".into());
     }
-    let mut reader = image::ImageReader::open(path)
-        .map_err(|e| format!("The picture could not be opened: {e}."))?
-        .with_guessed_format()
-        .map_err(|e| format!("The picture could not be read: {e}."))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(im::MAX_SIDE);
-    limits.max_image_height = Some(im::MAX_SIDE);
-    limits.max_alloc = Some(im::MAX_PIXELS * 4 * 2);
-    reader.limits(limits);
-    let img = reader.decode().map_err(|e| {
-        format!(
-            "The picture could not be decoded ({e}). PNG, JPEG, BMP, GIF, WebP and TIFF pictures up to {} × {} pixels are supported.",
-            im::MAX_SIDE,
-            im::MAX_SIDE
-        )
-    })?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    im::check_size(w, h)?;
-    let px: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
-    Rgba::new(w, h, px)
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("The picture could not be opened: {e}."))?;
+    crate::image_decode::decode(
+        std::io::BufReader::new(file),
+        image::ImageFormat::from_path(path).ok(),
+        crate::image_decode::BUILTIN,
+        |_| Ok(()),
+        || Ok(()),
+    )
+    .map(|decoded| decoded.rgba)
 }
 
 /// What a conversion produced.
@@ -886,6 +875,98 @@ pub fn image_preview(w: &ImageMidi) -> Option<crate::piano_roll::ToolPreview<'_>
 mod tests {
     use super::decode;
     use plumspirit_engine::codec::Crc32;
+
+    #[test]
+    fn native_conversion_keeps_exact_notes_palette_counts_and_thumbnail_in_both_key_modes_and_orientations()
+     {
+        use super::*;
+        use plumspirit_engine::{model::project::KeyRange, transform::paste::ColorNote};
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let green = [0, 255, 0, 255];
+        let clear = [0, 0, 0, 0];
+        for keys in [KeyRange::Standard, KeyRange::Extended256] {
+            let first = if keys == KeyRange::Standard { 60 } else { 200 };
+            for orientation in [Orientation::PianoRoll, Orientation::Upstream] {
+                let (w, h, pixels) = if orientation == Orientation::PianoRoll {
+                    (4, 2, vec![red, red, clear, blue, blue, blue, blue, green])
+                } else {
+                    (2, 4, vec![blue, green, clear, blue, red, blue, red, blue])
+                };
+                let image = Rgba::new(w, h, pixels).unwrap();
+                let settings = Settings {
+                    keys,
+                    first_key: first,
+                    last_key: first + 1,
+                    orientation,
+                    time_pixels: Some(4),
+                    ticks_per_pixel: 7,
+                    alpha_min: 128,
+                    palette: vec![[255, 0, 0], [0, 0, 255], [0, 255, 0]],
+                    ignored: vec![false, false, true],
+                    velocity: 99,
+                    ..Default::default()
+                };
+                let result = run_conversion(
+                    &image,
+                    &Inputs {
+                        settings,
+                        palette_mode: 2,
+                        palette_size: 3,
+                        seed: 0,
+                    },
+                )
+                .unwrap();
+                let (a, b) = if orientation == Orientation::PianoRoll {
+                    (first + 1, first)
+                } else {
+                    (first, first + 1)
+                };
+                let mut expected = vec![
+                    ColorNote {
+                        start: 0,
+                        dur: 14,
+                        pitch: a,
+                        vel: 99,
+                        color: 0,
+                    },
+                    ColorNote {
+                        start: 21,
+                        dur: 7,
+                        pitch: a,
+                        vel: 99,
+                        color: 1,
+                    },
+                    ColorNote {
+                        start: 0,
+                        dur: 21,
+                        pitch: b,
+                        vel: 99,
+                        color: 1,
+                    },
+                ];
+                expected.sort_unstable();
+                assert_eq!(result.art.notes, expected);
+                assert_eq!(result.counts, vec![1, 2, 0]);
+                assert_eq!(result.size, (w, h));
+                assert_eq!(result.palette, vec![[255, 0, 0], [0, 0, 255], [0, 255, 0]]);
+                let expected_pixels = image
+                    .px
+                    .iter()
+                    .map(|p| {
+                        if *p == clear || *p == green {
+                            egui::Color32::TRANSPARENT
+                        } else {
+                            egui::Color32::from_rgb(p[0], p[1], p[2])
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(result.thumb.pixels, expected_pixels);
+                assert_eq!(result.art.colors[0].name, "#FF0000");
+                assert_eq!(result.art.colors[1].name, "#0000FF");
+            }
+        }
+    }
 
     /// v0.9 256-Key Mode (S21 step 4b): the window takes the project's
     /// keyboard; keys a standard project lacks are pulled down to 127, and

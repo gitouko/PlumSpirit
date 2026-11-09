@@ -84,6 +84,11 @@ impl Harness {
         }
     }
 
+    /// Poll the real native job completion path (save/export/edit workers).
+    pub fn poll_background_jobs(&mut self) {
+        self.app.poll_job(&self.ctx, &self.frame);
+    }
+
     /// A main-menu command (only when it is enabled, as the menu bar does).
     /// Returns whether it ran.
     pub fn command(&mut self, c: Command) -> bool {

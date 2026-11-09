@@ -13,6 +13,10 @@ its MIDI channel. Both follow the Piano Roll's zoom. Click a graph to make it th
 * Velocity bars belong to the notes: drag one to set the selected notes' velocity.
 * **List** opens the {cmd:ToggleEventList} of the active graph.
 
+On Windows, selected CC, Pitch Bend and Master Volume points can be pasted
+into a matching graph in another PlumSpirit window. For CC and Pitch Bend,
+choose the same MIDI channel in the destination graph.
+
 ## Curve tools
 
 Drag from the start value to the end value: **Line**, **Gentle**, **Fast**, **S Curve**,

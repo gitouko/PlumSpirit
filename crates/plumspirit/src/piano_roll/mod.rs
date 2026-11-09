@@ -17,6 +17,8 @@ pub mod markers;
 pub mod render;
 pub mod ruler;
 pub mod velocity;
+#[cfg(test)]
+mod view_frame_tests;
 pub mod viewport;
 
 use crate::diagnostics::RenderStats;
@@ -255,6 +257,8 @@ impl Geometry {
 pub enum CaptureMode {
     /// A drag records a freehand stroke.
     Freehand,
+    /// Custom tools retain a bounded ordered egui event batch in the same stroke buffer.
+    FreehandOrdered,
     /// Each click adds a corner.
     Polygon,
 }
@@ -324,6 +328,7 @@ pub enum RollAction {
     },
     /// v0.7 stroke tools: the stroke drawn so far (tick, fractional pitch,
     /// seconds since it began); `done` when the button was released.
+    StrokeCanceled,
     Stroke {
         points: Vec<(u64, f64, f64)>,
         done: bool,
@@ -593,6 +598,12 @@ pub struct RollInput<'a> {
 
 /// What the open v0.7 tool previews on the active track.
 pub enum ToolPreview<'a> {
+    /// An already-staged immutable native result, queried only in the viewport.
+    Store {
+        notes: &'a plumspirit_engine::model::NoteStore,
+        all: bool,
+        rev: u64,
+    },
     /// The computed result (sorted by start) and its longest note.
     Run {
         notes: &'a [plumspirit_engine::transform::TNote],
@@ -631,7 +642,9 @@ impl ToolPreview<'_> {
     /// The tool replaces every note of the track (not only the selection).
     pub fn all(&self) -> bool {
         match self {
-            ToolPreview::Run { all, .. } | ToolPreview::Lazy { all, .. } => *all,
+            ToolPreview::Run { all, .. }
+            | ToolPreview::Lazy { all, .. }
+            | ToolPreview::Store { all, .. } => *all,
         }
     }
 }
@@ -713,6 +726,9 @@ pub struct PianoRoll {
     audition: bool,
     /// Note area of the last frame (overlays drawn by the app).
     notes_rect: Option<Rect>,
+    capture_view: bool,
+    view_frame: Option<viewport::ViewFrame>,
+    overlay_layer: Option<(egui::Painter, egui::layers::ShapeIdx)>,
     /// The stroke being drawn (tick, fractional pitch, seconds) and when it
     /// began.
     stroke_buf: Vec<(u64, f64, f64)>,
@@ -747,6 +763,19 @@ impl PianoRoll {
     /// The note area as drawn last frame (for overlays such as the Progressor).
     pub fn notes_rect(&self) -> Option<Rect> {
         self.notes_rect
+    }
+    pub fn capture_view(&mut self, enabled: bool) {
+        self.capture_view = enabled;
+        if !enabled {
+            self.view_frame = None;
+            self.overlay_layer = None;
+        }
+    }
+    pub fn view_frame(&self) -> Option<viewport::ViewFrame> {
+        self.view_frame
+    }
+    pub fn take_overlay_layer(&mut self) -> Option<(egui::Painter, egui::layers::ShapeIdx)> {
+        self.overlay_layer.take()
     }
 
     /// A piano key is held for audition.
@@ -806,6 +835,9 @@ impl Default for PianoRoll {
             meter: None,
             audition: false,
             notes_rect: None,
+            capture_view: false,
+            view_frame: None,
+            overlay_layer: None,
             stroke_buf: Vec::new(),
             stroke_began: None,
             stroke_sent: 0,
@@ -1251,6 +1283,35 @@ impl PianoRoll {
         input: RollInput<'_>,
         generation: u64,
     ) -> Vec<RollAction> {
+        self.show_with_extent(ui, input, generation, None)
+    }
+
+    /// Private immutable import browser: native navigation only, no emitted actions.
+    /// Its content extent avoids scanning the whole staged project's placements.
+    pub(crate) fn show_staged(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut input: RollInput<'_>,
+        generation: u64,
+        extent: u64,
+    ) {
+        input.editable = false;
+        input.keyboard = false;
+        input.audition = false;
+        input.capture = None;
+        input.note_menu = None;
+        let _ = self.show_with_extent(ui, input, generation, Some(extent));
+    }
+
+    fn show_with_extent(
+        &mut self,
+        ui: &mut egui::Ui,
+        input: RollInput<'_>,
+        generation: u64,
+        extent: Option<u64>,
+    ) -> Vec<RollAction> {
+        self.overlay_layer = None;
+        self.view_frame = None;
         let mut actions = Vec::new();
         self.user_panned = false;
         let full = ui.available_rect_before_wrap();
@@ -1308,7 +1369,9 @@ impl PianoRoll {
         self.keep_y_policy(h);
         // The scrollable extent on the roll's axis: the song (with the edit
         // cursor) moved into content ticks, and an opened content's notes.
-        let content_end = if input.shift == 0 && input.content.is_none() {
+        let content_end = if let Some(extent) = extent {
+            extent.max(self.cursor_tick)
+        } else if input.shift == 0 && input.content.is_none() {
             doc.content_end_tick().max(self.cursor_tick)
         } else {
             song_of(doc.content_end_tick().max(self.cursor_tick), -input.shift)
@@ -1401,7 +1464,13 @@ impl PianoRoll {
                         self.view.zoom_time(
                             f64::from(anchor.x - g0.notes.left()),
                             f,
-                            viewport::zoom_span(doc, self.cursor_tick),
+                            extent.map_or_else(
+                                || viewport::zoom_span(doc, self.cursor_tick),
+                                |e| {
+                                    e.max(self.cursor_tick)
+                                        .max(doc.division().musical_ppqn().unwrap_or(480) * 16)
+                                },
+                            ),
                             w,
                         );
                     } else if m.shift {
@@ -1425,6 +1494,9 @@ impl PianoRoll {
 
         // Escape / right-click cancel the transient gesture (nothing is committed).
         if escape && input.keyboard && !matches!(self.gesture, Gesture::None) {
+            if matches!(self.gesture, Gesture::Stroke) {
+                actions.push(RollAction::StrokeCanceled);
+            }
             self.cancel_gesture();
         }
         if secondary_pressed
@@ -1434,6 +1506,114 @@ impl PianoRoll {
             )
         {
             self.cancel_gesture();
+        }
+
+        // Custom tools extend the existing native stroke engine with ordered input.
+        // Polling only the final pointer position loses fast down/move/up batches.
+        let mut ordered_handled = false;
+        if input.capture == Some(CaptureMode::FreehandOrdered) {
+            let overflow = events.len() > 256;
+            if overflow && matches!(self.gesture, Gesture::Stroke) {
+                self.cancel_gesture();
+                actions.push(RollAction::StrokeCanceled);
+                ordered_handled = true;
+            }
+            if !overflow && !escape {
+                for event in &events {
+                    match event {
+                        Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed: true,
+                            ..
+                        } if matches!(self.gesture, Gesture::None)
+                            && input.editable
+                            && g.notes.contains(*pos)
+                            && ui
+                                .ctx()
+                                .layer_id_at(*pos)
+                                .is_none_or(|l| l == ui.layer_id()) =>
+                        {
+                            self.stroke_buf.clear();
+                            self.stroke_sent = 0;
+                            self.stroke_buf
+                                .push((g.tick_at(pos.x), g.pitch_f_at(pos.y), 0.));
+                            self.stroke_began = Some(std::time::Instant::now());
+                            self.gesture = Gesture::Stroke;
+                            ordered_handled = true;
+                        }
+                        Event::PointerMoved(pos) if matches!(self.gesture, Gesture::Stroke) => {
+                            ordered_handled = true;
+                            let moved = self
+                                .stroke_buf
+                                .last()
+                                .is_none_or(|p| (g.point_of(p.0, p.1) - *pos).length() >= 2.);
+                            if moved
+                                && self.stroke_buf.len()
+                                    < plumspirit_engine::transform::MAX_STROKE_POINTS
+                            {
+                                let time =
+                                    self.stroke_began.map_or(0., |b| b.elapsed().as_secs_f64());
+                                self.stroke_buf
+                                    .push((g.tick_at(pos.x), g.pitch_f_at(pos.y), time));
+                            }
+                        }
+                        Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed: false,
+                            ..
+                        } if matches!(self.gesture, Gesture::Stroke) => {
+                            ordered_handled = true;
+                            let p = (g.tick_at(pos.x), g.pitch_f_at(pos.y));
+                            if self
+                                .stroke_buf
+                                .last()
+                                .is_none_or(|q| q.0 != p.0 || q.1 != p.1)
+                                && self.stroke_buf.len()
+                                    < plumspirit_engine::transform::MAX_STROKE_POINTS
+                            {
+                                self.stroke_buf.push((
+                                    p.0,
+                                    p.1,
+                                    self.stroke_began.map_or(0., |b| b.elapsed().as_secs_f64()),
+                                ));
+                            }
+                            self.stroke_began = None;
+                            self.gesture = Gesture::None;
+                            actions.push(RollAction::Stroke {
+                                points: std::mem::take(&mut self.stroke_buf),
+                                done: true,
+                            });
+                        }
+                        Event::WindowFocused(false) | Event::PointerGone
+                            if matches!(self.gesture, Gesture::Stroke) =>
+                        {
+                            ordered_handled = true;
+                            self.cancel_gesture();
+                            actions.push(RollAction::StrokeCanceled);
+                        }
+                        Event::PointerButton {
+                            button: PointerButton::Middle | PointerButton::Secondary,
+                            pressed: true,
+                            ..
+                        } if matches!(self.gesture, Gesture::Stroke) => {
+                            ordered_handled = true;
+                            self.cancel_gesture();
+                            actions.push(RollAction::StrokeCanceled);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if matches!(self.gesture, Gesture::Stroke) && self.stroke_sent != self.stroke_buf.len()
+            {
+                self.stroke_sent = self.stroke_buf.len();
+                actions.push(RollAction::Stroke {
+                    points: self.stroke_buf.clone(),
+                    done: false,
+                });
+            }
         }
 
         // Middle-drag pans (always allowed).
@@ -1505,6 +1685,9 @@ impl PianoRoll {
 
         // Presses start gestures.
         if pressed
+            && !ordered_handled
+            && !(input.capture == Some(CaptureMode::FreehandOrdered)
+                && pointer_pos.is_some_and(|p| g.notes.contains(p)))
             && matches!(self.gesture, Gesture::None)
             && let Some(pos) = pointer_pos
         {
@@ -1515,7 +1698,7 @@ impl PianoRoll {
             {
                 let pt = (g.tick_at(pos.x), g.pitch_f_at(pos.y));
                 match mode {
-                    CaptureMode::Freehand => {
+                    CaptureMode::Freehand | CaptureMode::FreehandOrdered => {
                         self.stroke_buf.clear();
                         self.stroke_buf.push((pt.0, pt.1, 0.0));
                         self.stroke_began = Some(std::time::Instant::now());
@@ -1638,7 +1821,9 @@ impl PianoRoll {
         self.alt_held = modifiers.alt;
         self.ctrl_held = modifiers.command;
         if let Some(pos) = pointer_pos {
-            if matches!(self.gesture, Gesture::Stroke) {
+            if matches!(self.gesture, Gesture::Stroke)
+                && input.capture != Some(CaptureMode::FreehandOrdered)
+            {
                 let t = self.stroke_began.map_or(0.0, |b| b.elapsed().as_secs_f64());
                 let pt = (g.tick_at(pos.x), g.pitch_f_at(pos.y));
                 let moved = self.stroke_buf.last().is_none_or(|l| {
@@ -1890,6 +2075,9 @@ impl PianoRoll {
                 &mut stats,
             );
         }
+        self.overlay_layer = self
+            .capture_view
+            .then(|| (notes_painter.clone(), notes_painter.add(egui::Shape::Noop)));
         // Preview layer: above the committed notes, below selection overlays and
         // the playhead; never part of the document.
         if let Some((k, scope)) = input.preview
@@ -2264,6 +2452,28 @@ impl PianoRoll {
                 .on_hover_text_at_pointer(key_hover_text(pitch, input.key_colors));
         }
         self.notes_rect = Some(g.notes);
+        if self.capture_view {
+            self.view_frame = input
+                .doc
+                .track(input.track_index)
+                .map(|track| viewport::ViewFrame {
+                    rect: g.notes,
+                    view: g.view,
+                    shift: input.shift,
+                    track: track.id(),
+                    content: input.content,
+                    locked: input.locked.is_some() || !input.editable,
+                    conductor: input.conductor_active,
+                    pixels_per_point: ppp,
+                    document: std::ptr::from_ref(input.doc) as usize,
+                    revisions: [
+                        input.doc.structure_revision(),
+                        input.doc.analysis_revision(),
+                        input.doc.layout_revision(),
+                        input.doc.tempo_revision(),
+                    ],
+                });
+        }
         // Scrollbars.
         let extent = self.view.scroll_extent(content_end, w) as f64;
         let hthumb = render::scrollbar_thumb(
@@ -3235,7 +3445,7 @@ mod tests {
 
     /// The roll's input for the session tests.
     #[allow(clippy::too_many_arguments)]
-    fn session_input<'a>(
+    pub(super) fn session_input<'a>(
         doc: &'a PlumDocument,
         meter: &'a MeterMap,
         track: usize,
@@ -4003,6 +4213,7 @@ mod tests {
             let meter = MeterMap::new(doc.division(), &doc.conductor().meter_events());
             let ctx = egui::Context::default();
             let mut roll = PianoRoll::default();
+            roll.capture_view(true);
             roll.view.time = plumspirit_engine::view::TimeAxis::new(0, 0.3);
             let mut shapes = Vec::new();
             for _ in 0..200 {
@@ -4051,6 +4262,15 @@ mod tests {
                         },
                         1,
                     );
+                    let (painter, slot) = roll.take_overlay_layer().expect("native reserved layer");
+                    let rect = roll.notes_rect().unwrap();
+                    painter.set(
+                        slot,
+                        egui::Shape::line_segment(
+                            [rect.left_center(), rect.right_center()],
+                            egui::Stroke::new(3.0, egui::Color32::from_rgb(7, 19, 43)),
+                        ),
+                    );
                 });
                 o.textures_delta.clear();
                 shapes = o.shapes;
@@ -4067,6 +4287,11 @@ mod tests {
                     matches!(&c.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == crate::ui::theme::DARK.playhead)
                 })
                 .expect("the playhead line");
+            let overlay = shapes.iter().position(|c| matches!(&c.shape,egui::Shape::LineSegment{stroke,..} if stroke.color==egui::Color32::from_rgb(7,19,43))).expect("native reserved overlay is filled");
+            assert!(
+                overlay < playhead,
+                "reserved overlay remains below playhead"
+            );
             // Every note mesh (exact meshes or tile meshes) comes before it.
             let meshes: Vec<usize> = shapes
                 .iter()
@@ -4078,6 +4303,10 @@ mod tests {
             let notes_area = roll.notes_rect().unwrap();
             for &i in &meshes {
                 if shapes[i].clip_rect == notes_area {
+                    assert!(
+                        i < overlay,
+                        "{dense_notes}: a native note mesh after the overlay"
+                    );
                     assert!(
                         i < playhead,
                         "{dense_notes}: a note mesh after the playhead"

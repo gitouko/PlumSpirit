@@ -13,8 +13,11 @@ use crate::ui::fonts::{self as uifonts, InstalledFace};
 use plumspirit_engine::spiderweb::paths::P;
 use plumspirit_engine::spiderweb::text::{self, FontSource};
 use skrifa::instance::{LocationRef, Size};
-use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::outline::{
+    DrawSettings, Hinting, OutlineGlyphCollection, OutlineGlyphFormat, OutlinePen,
+};
 use skrifa::raw::TableProvider;
+use skrifa::raw::types::GlyphId;
 use skrifa::{FontRef, MetadataProvider};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -188,14 +191,56 @@ impl Scan {
 }
 
 /// A pen collecting closed cubic contours in em units.
-struct Pen {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutlineError {
+    Unsupported,
+    Points,
+    Contours,
+    Stopped,
+    Invalid,
+    Draw,
+}
+struct Control<'a> {
+    max_points: usize,
+    max_contours: usize,
+    points: usize,
+    stopped: Option<OutlineError>,
+    check: &'a mut dyn FnMut() -> bool,
+}
+struct Pen<'a> {
     upem: f64,
     slant: f64,
     contours: Vec<Vec<P>>,
     cur: Vec<P>,
+    control: Option<Control<'a>>,
 }
 
-impl Pen {
+impl Pen<'_> {
+    fn append(&mut self, points: &[P]) {
+        if let Some(control) = &mut self.control {
+            if control.stopped.is_some() {
+                return;
+            }
+            if !(control.check)() {
+                control.stopped = Some(OutlineError::Stopped);
+                return;
+            }
+            if control.points + points.len() > control.max_points {
+                control.stopped = Some(OutlineError::Points);
+                return;
+            }
+            if points
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || v.abs() > 1e12)
+            {
+                control.stopped = Some(OutlineError::Invalid);
+                return;
+            }
+            control.points += points.len();
+        }
+        self.cur.extend_from_slice(points);
+    }
     fn p(&self, x: f32, y: f32) -> P {
         let (x, y) = (f64::from(x) / self.upem, f64::from(y) / self.upem);
         [x + y * self.slant, y]
@@ -205,22 +250,38 @@ impl Pen {
     }
     fn line(&mut self, b: P) {
         let a = self.last();
-        self.cur
-            .push([a[0] + (b[0] - a[0]) / 3.0, a[1] + (b[1] - a[1]) / 3.0]);
-        self.cur.push([
-            a[0] + 2.0 * (b[0] - a[0]) / 3.0,
-            a[1] + 2.0 * (b[1] - a[1]) / 3.0,
+        self.append(&[
+            [a[0] + (b[0] - a[0]) / 3.0, a[1] + (b[1] - a[1]) / 3.0],
+            [
+                a[0] + 2.0 * (b[0] - a[0]) / 3.0,
+                a[1] + 2.0 * (b[1] - a[1]) / 3.0,
+            ],
+            b,
         ]);
-        self.cur.push(b);
     }
     fn finish(&mut self) {
+        if self.control.as_ref().is_some_and(|c| c.stopped.is_some()) {
+            self.cur.clear();
+            return;
+        }
         if self.cur.len() >= 2 {
             let start = self.cur[0];
             if self.last() != start {
                 self.line(start);
             }
         }
+        if self.control.as_ref().is_some_and(|c| c.stopped.is_some()) {
+            self.cur.clear();
+            return;
+        }
         if self.cur.len() >= 4 {
+            if let Some(control) = &mut self.control
+                && self.contours.len() >= control.max_contours
+            {
+                control.stopped = Some(OutlineError::Contours);
+                self.cur.clear();
+                return;
+            }
             self.contours.push(std::mem::take(&mut self.cur));
         } else {
             self.cur.clear();
@@ -228,11 +289,11 @@ impl Pen {
     }
 }
 
-impl OutlinePen for Pen {
+impl OutlinePen for Pen<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
         self.finish();
         let p = self.p(x, y);
-        self.cur.push(p);
+        self.append(&[p]);
     }
     fn line_to(&mut self, x: f32, y: f32) {
         let p = self.p(x, y);
@@ -242,23 +303,100 @@ impl OutlinePen for Pen {
         let a = self.last();
         let c = self.p(cx, cy);
         let b = self.p(x, y);
-        self.cur.push([
-            a[0] + 2.0 / 3.0 * (c[0] - a[0]),
-            a[1] + 2.0 / 3.0 * (c[1] - a[1]),
+        self.append(&[
+            [
+                a[0] + 2.0 / 3.0 * (c[0] - a[0]),
+                a[1] + 2.0 / 3.0 * (c[1] - a[1]),
+            ],
+            [
+                b[0] + 2.0 / 3.0 * (c[0] - b[0]),
+                b[1] + 2.0 / 3.0 * (c[1] - b[1]),
+            ],
+            b,
         ]);
-        self.cur.push([
-            b[0] + 2.0 / 3.0 * (c[0] - b[0]),
-            b[1] + 2.0 / 3.0 * (c[1] - b[1]),
-        ]);
-        self.cur.push(b);
     }
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         let (c0, c1, b) = (self.p(cx0, cy0), self.p(cx1, cy1), self.p(x, y));
-        self.cur.extend([c0, c1, b]);
+        self.append(&[c0, c1, b]);
     }
     fn close(&mut self) {
         self.finish();
     }
+}
+
+pub(crate) fn outline_format(font: &FontRef<'_>) -> &'static str {
+    if font.varc().is_ok() {
+        "varc"
+    } else if font.glyf().is_ok() {
+        "glyf"
+    } else if font.cff().is_ok() {
+        "cff"
+    } else if font.cff2().is_ok() {
+        "cff2"
+    } else {
+        "none"
+    }
+}
+fn bounded_glyphs<'a>(font: &FontRef<'a>) -> Result<OutlineGlyphCollection<'a>, OutlineError> {
+    // Unhinted glyf decoding has the library's64Kpoint/recursion bounds. CFF's
+    // subroutine nesting limit alone is not a total operation budget.
+    if outline_format(font) != "glyf" {
+        return Err(OutlineError::Unsupported);
+    }
+    OutlineGlyphCollection::with_format(font, OutlineGlyphFormat::Glyf)
+        .ok_or(OutlineError::Unsupported)
+}
+pub(crate) fn outline_memory(font: &FontRef<'_>, glyph: u32) -> Result<usize, OutlineError> {
+    Ok(bounded_glyphs(font)?
+        .get(GlyphId::new(glyph))
+        .map_or(0, |g| g.draw_memory_size(Hinting::None)))
+}
+pub(crate) fn bounded_outline(
+    font: &FontRef<'_>,
+    glyph: u32,
+    max_points: usize,
+    max_contours: usize,
+    memory: &mut [u8],
+    check: &mut dyn FnMut() -> bool,
+) -> Result<Vec<Vec<P>>, OutlineError> {
+    if !check() {
+        return Err(OutlineError::Stopped);
+    }
+    let glyphs = bounded_glyphs(font)?;
+    let Some(glyph) = glyphs.get(GlyphId::new(glyph)) else {
+        return Ok(Vec::new());
+    };
+    let metrics = font.metrics(Size::unscaled(), LocationRef::default());
+    let mut pen = Pen {
+        upem: f64::from(metrics.units_per_em.max(1)),
+        slant: 0.,
+        contours: Vec::new(),
+        cur: Vec::new(),
+        control: Some(Control {
+            max_points,
+            max_contours,
+            points: 0,
+            stopped: None,
+            check,
+        }),
+    };
+    let result = glyph.draw(
+        DrawSettings::unhinted(Size::unscaled(), LocationRef::default()).with_memory(Some(memory)),
+        &mut pen,
+    );
+    pen.finish();
+    if let Some(error) = pen.control.as_ref().and_then(|c| c.stopped) {
+        return Err(error);
+    }
+    result.map_err(|_| OutlineError::Draw)?;
+    if pen
+        .contours
+        .iter()
+        .any(|c| c.len() < 4 || !(c.len() - 1).is_multiple_of(3) || c.first() != c.last())
+    {
+        return Err(OutlineError::Invalid);
+    }
+    Ok(pen.contours)
 }
 
 /// A loaded face as the engine's font source.
@@ -363,6 +501,7 @@ impl LoadedFont {
             slant: self.slant,
             contours: Vec::new(),
             cur: Vec::new(),
+            control: None,
         };
         if let Some(g) = font.outline_glyphs().get(gid) {
             let _ = g.draw(
@@ -458,6 +597,115 @@ impl FontSource for LoadedFont {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_glyf_conversion_matches_the_existing_native_source() {
+        let defs = egui::FontDefinitions::default();
+        let data = Arc::new(defs.font_data["Ubuntu-Light"].font.to_vec());
+        let legacy = LoadedFont::load(Arc::clone(&data), 0, 0., false).unwrap();
+        let face = FontRef::from_index(&data, 0).unwrap();
+        for ch in ['O', 'A', 'g', 'é', ' '] {
+            let id = face.charmap().map(ch).unwrap().to_u32();
+            let size = outline_memory(&face, id).unwrap();
+            let mut memory = vec![0; size];
+            let actual = bounded_outline(&face, id, 4096, 64, &mut memory, &mut || true).unwrap();
+            let expected = legacy.glyph(ch).1;
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(expected.iter()) {
+                assert_eq!(a.len(), b.len());
+                for (a, b) in a.iter().zip(b.iter()) {
+                    assert_eq!(a.map(f64::to_bits), b.map(f64::to_bits));
+                }
+            }
+        }
+        let id = face.charmap().map('O').unwrap().to_u32();
+        assert!(outline_memory(&face, id).unwrap() > 0);
+        assert_eq!(
+            bounded_outline(&face, id, 4096, 64, &mut [], &mut || true),
+            Err(OutlineError::Draw)
+        );
+    }
+
+    #[test]
+    fn bounded_outline_collector_refuses_nonfinite_and_excess_points() {
+        let mut check = || true;
+        let mut pen = Pen {
+            upem: 1.,
+            slant: 0.,
+            contours: Vec::new(),
+            cur: Vec::new(),
+            control: Some(Control {
+                max_points: 3,
+                max_contours: 1,
+                points: 0,
+                stopped: None,
+                check: &mut check,
+            }),
+        };
+        pen.move_to(0., 0.);
+        pen.line_to(1., 1.);
+        pen.finish();
+        assert_eq!(
+            pen.control.as_ref().unwrap().stopped,
+            Some(OutlineError::Points)
+        );
+        assert!(pen.contours.is_empty());
+        let mut pen = Pen {
+            upem: 1.,
+            slant: 0.,
+            contours: Vec::new(),
+            cur: Vec::new(),
+            control: Some(Control {
+                max_points: 10,
+                max_contours: 1,
+                points: 0,
+                stopped: None,
+                check: &mut check,
+            }),
+        };
+        pen.move_to(f32::NAN, 0.);
+        assert_eq!(
+            pen.control.as_ref().unwrap().stopped,
+            Some(OutlineError::Invalid)
+        );
+    }
+
+    /// Explicit refactoring fixture: never runs in ordinary App tests.
+    #[test]
+    #[ignore]
+    fn native_font_digest_dump() {
+        use std::io::Write;
+        let path = std::env::var("PLUMSPIRIT_NATIVE_FONT_DIGEST_OUT").expect("digest output path");
+        let defs = egui::FontDefinitions::default();
+        let data = Arc::new(defs.font_data["Ubuntu-Light"].font.to_vec());
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        for (bold, italic) in [(0., false), (0.03, false), (0., true), (0.03, true)] {
+            let font = LoadedFont::load(Arc::clone(&data), 0, bold, italic).unwrap();
+            for ch in ['O', 'A', 'W', 'g', 'é', 'Σ', '♯', 'Ж', '♪', '😀', ' '] {
+                let (advance, contours) = font.glyph(ch);
+                let mut hash = 0xcbf29ce484222325u64;
+                let mut add = |value: u64| {
+                    hash ^= value;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                };
+                add(advance.to_bits());
+                for contour in &contours {
+                    add(contour.len() as u64);
+                    for p in contour {
+                        add(p[0].to_bits());
+                        add(p[1].to_bits());
+                    }
+                }
+                writeln!(
+                    out,
+                    "{bold} {italic} {ch:?} {} {:016x}",
+                    contours.len(),
+                    hash
+                )
+                .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn style_names_give_weight_and_slant() {

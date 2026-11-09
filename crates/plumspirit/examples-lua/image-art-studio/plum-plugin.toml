@@ -1,0 +1,10 @@
+id="plumspirit.example.image-art-studio"
+name="Image Art Studio"
+version="0.2.0"
+api="0.2"
+entry="main.lua"
+config_version=1
+description="Author-written image artwork and mask editing with bounded captured pixels, native note transactions and Preview/Undo."
+author="PlumSpirit"
+license="Same terms as PlumSpirit"
+capabilities=["project.read","notes.edit","file.read_user_choice","ui.panels"]

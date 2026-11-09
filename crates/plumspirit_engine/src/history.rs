@@ -370,6 +370,10 @@ pub enum Operation {
     },
     /// Replaces the project's note-group table (v0.7: Group / Ungroup, lock,
     /// names, paste remapping). Note group ids change through note edits.
+    SetMetadata {
+        table: Box<crate::model::metadata::Metadata>,
+        label: &'static str,
+    },
     SetGroups {
         table: Box<crate::model::GroupTable>,
         label: &'static str,
@@ -426,6 +430,7 @@ impl Operation {
             | Operation::Events { label, .. }
             | Operation::TrackProps { label, .. }
             | Operation::Group { label, .. }
+            | Operation::SetMetadata { label, .. }
             | Operation::SetGroups { label, .. }
             | Operation::SetFolders { label, .. }
             | Operation::SetClips { label, .. }
@@ -671,6 +676,10 @@ enum Change {
         new: u8,
     },
     Group(Vec<Change>),
+    Metadata {
+        old: Box<crate::model::metadata::Metadata>,
+        new: Box<crate::model::metadata::Metadata>,
+    },
     Groups {
         old: Box<crate::model::GroupTable>,
         new: Box<crate::model::GroupTable>,
@@ -772,6 +781,7 @@ impl Change {
             Change::NoteSubs { ranks, old, .. } => ranks.heap_bytes() + old.capacity() * 4,
             Change::Name { old, new } => old.capacity() + new.capacity(),
             Change::Keys { .. } => 0,
+            Change::Metadata { old, new } => old.heap_bytes() + new.heap_bytes() + 64,
             Change::Groups { old, new } => old.heap_bytes() + new.heap_bytes() + 64,
             Change::Folders { old, new } => old.heap_bytes() + new.heap_bytes() + 64,
             Change::Clips(c) => c.heap_bytes() + 64,
@@ -816,6 +826,7 @@ impl Change {
             Change::Conductor(_)
             | Change::Name { .. }
             | Change::Keys { .. }
+            | Change::Metadata { .. }
             | Change::Groups { .. }
             | Change::Folders { .. }
             | Change::Clips(_)
@@ -1488,6 +1499,18 @@ impl History {
                     .iter()
                     .map(Track::id)
                     .collect();
+                let metadata = doc.project().metadata.removing_tracks(&ids);
+                if let Some(table) = &metadata {
+                    let needed = doc
+                        .project()
+                        .metadata
+                        .heap_bytes()
+                        .saturating_add(table.heap_bytes())
+                        .saturating_add(64);
+                    if self.over_budget(needed) {
+                        return Err(self.too_large(needed, Operation::DeleteTrack { index }));
+                    }
+                }
                 let clips = purge_clips(doc, &ids)?;
                 let (tracks, shifted) = match doc.take_tracks(index, count) {
                     Ok(v) => v,
@@ -1510,11 +1533,27 @@ impl History {
                     shifted,
                     stash: Some(tracks),
                 };
+                let change = match clips {
+                    Some(c) => Change::Group(vec![Change::Clips(c), track]),
+                    None => track,
+                };
+                let change = if let Some(new) = metadata {
+                    let old = Box::new(std::mem::replace(
+                        &mut doc.project_mut().metadata,
+                        new.clone(),
+                    ));
+                    Change::Group(vec![
+                        change,
+                        Change::Metadata {
+                            old,
+                            new: Box::new(new),
+                        },
+                    ])
+                } else {
+                    change
+                };
                 Ok((
-                    Some(match clips {
-                        Some(c) => Change::Group(vec![Change::Clips(c), track]),
-                        None => track,
-                    }),
+                    Some(change),
                     Outcome::Track(index.min(doc.track_count() - 1)),
                 ))
             }
@@ -1961,7 +2000,32 @@ impl History {
                 set_key_range(doc, keys)?;
                 Ok((Some(Change::Keys { old, new: keys }), Outcome::Done))
             }
-            Operation::SetGroups { table, .. } => {
+            Operation::SetMetadata { table, label } => {
+                table
+                    .validate_targets(doc)
+                    .map_err(|m| HistoryError::Edit(EditError::Invalid(m)))?;
+                table
+                    .validate()
+                    .map_err(|m| HistoryError::Edit(EditError::Invalid(m)))?;
+                if doc.project().metadata == *table {
+                    return Ok((None, Outcome::Unchanged));
+                }
+                let needed = doc
+                    .project()
+                    .metadata
+                    .heap_bytes()
+                    .saturating_add(table.heap_bytes())
+                    .saturating_add(64);
+                if self.over_budget(needed) {
+                    return Err(self.too_large(needed, Operation::SetMetadata { table, label }));
+                }
+                let old = Box::new(std::mem::replace(
+                    &mut doc.project_mut().metadata,
+                    (*table).clone(),
+                ));
+                Ok((Some(Change::Metadata { old, new: table }), Outcome::Done))
+            }
+            Operation::SetGroups { table, label } => {
                 table.validate().map_err(|m| {
                     HistoryError::Edit(EditError::Invalid(format!(
                         "The note groups are invalid ({m}). Nothing was changed."
@@ -1970,11 +2034,39 @@ impl History {
                 if doc.project().groups == *table {
                     return Ok((None, Outcome::Unchanged));
                 }
+                let metadata = doc.project().metadata.removing_groups(&table);
+                if let Some(new) = &metadata {
+                    let needed = doc
+                        .project()
+                        .metadata
+                        .heap_bytes()
+                        .saturating_add(new.heap_bytes())
+                        .saturating_add(64);
+                    if self.over_budget(needed) {
+                        return Err(self.too_large(needed, Operation::SetGroups { table, label }));
+                    }
+                }
                 let old = Box::new(std::mem::replace(
                     &mut doc.project_mut().groups,
                     (*table).clone(),
                 ));
-                Ok((Some(Change::Groups { old, new: table }), Outcome::Done))
+                let group = Change::Groups { old, new: table };
+                let change = if let Some(new) = metadata {
+                    let old = Box::new(std::mem::replace(
+                        &mut doc.project_mut().metadata,
+                        new.clone(),
+                    ));
+                    Change::Group(vec![
+                        group,
+                        Change::Metadata {
+                            old,
+                            new: Box::new(new),
+                        },
+                    ])
+                } else {
+                    group
+                };
+                Ok((Some(change), Outcome::Done))
             }
             Operation::SetFolders { folders, .. } => {
                 folders.validate().map_err(|m| {
@@ -2309,7 +2401,21 @@ impl History {
                 Outcome::Notes(removed.len())
             }
             Operation::AddTrack => Outcome::Track(doc.add_track()?),
-            Operation::DeleteTrack { index } => Outcome::Track(doc.delete_track(index)?),
+            Operation::DeleteTrack { index } => {
+                if index >= doc.track_count() {
+                    return Err(DocumentError::NoSuchTrack.into());
+                }
+                let ids: Vec<_> = doc.tracks()[index..doc.subtree_end(index)]
+                    .iter()
+                    .map(Track::id)
+                    .collect();
+                let metadata = doc.project().metadata.removing_tracks(&ids);
+                let result = doc.delete_track(index)?;
+                if let Some(table) = metadata {
+                    doc.project_mut().metadata = table;
+                }
+                Outcome::Track(result)
+            }
             Operation::MoveTracks { from, to, parent } => {
                 doc.move_tracks(from, to, parent)?;
                 Outcome::Track(to)
@@ -2335,13 +2441,27 @@ impl History {
                 set_key_range(doc, keys)?;
                 Outcome::Done
             }
+            Operation::SetMetadata { table, .. } => {
+                table
+                    .validate_targets(doc)
+                    .map_err(|m| HistoryError::Edit(EditError::Invalid(m)))?;
+                table
+                    .validate()
+                    .map_err(|m| HistoryError::Edit(EditError::Invalid(m)))?;
+                doc.project_mut().metadata = *table;
+                Outcome::Done
+            }
             Operation::SetGroups { table, .. } => {
                 table.validate().map_err(|m| {
                     HistoryError::Edit(EditError::Invalid(format!(
                         "The note groups are invalid ({m}). Nothing was changed."
                     )))
                 })?;
+                let metadata = doc.project().metadata.removing_groups(&table);
                 doc.project_mut().groups = *table;
+                if let Some(new) = metadata {
+                    doc.project_mut().metadata = new;
+                }
                 Outcome::Done
             }
             Operation::SetFolders { folders, .. } => {
@@ -2620,6 +2740,10 @@ fn revert(doc: &mut PlumDocument, change: &mut Change) -> Result<(), String> {
             Ok(())
         }
         Change::Keys { old, .. } => restore_key_range(doc, *old),
+        Change::Metadata { old, .. } => {
+            doc.project_mut().metadata = (**old).clone();
+            Ok(())
+        }
         Change::Groups { old, .. } => {
             doc.project_mut().groups = (**old).clone();
             Ok(())
@@ -2815,6 +2939,10 @@ fn reapply(doc: &mut PlumDocument, change: &mut Change) -> Result<(), String> {
             Ok(())
         }
         Change::Keys { new, .. } => restore_key_range(doc, *new),
+        Change::Metadata { new, .. } => {
+            doc.project_mut().metadata = (**new).clone();
+            Ok(())
+        }
         Change::Groups { new, .. } => {
             doc.project_mut().groups = (**new).clone();
             Ok(())

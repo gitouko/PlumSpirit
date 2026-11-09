@@ -1,0 +1,9 @@
+id = "plumspirit.example.custom-graph-laboratory"
+name = "Custom Graph Laboratory"
+version = "0.2.0"
+api = "0.2"
+entry = "main.lua"
+description = "Author-written interactive Bézier, polar and MIDI envelope graphs using the bounded panel/canvas API."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "notes.edit", "ui.panels"]

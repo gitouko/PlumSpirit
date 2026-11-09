@@ -98,6 +98,172 @@ fn user_settings_and_presets_persist_between_sessions() {
 }
 
 #[test]
+fn graph_numbers_roundtrip_bit_exactly_through_presets_and_user_config() {
+    let dir = temp("exact-graph-numbers");
+    // Include the actual zoom span that drifted by one ULP in the Windows
+    // graph laboratory, both signs, small/large values and adjacent numbers.
+    let source = r#"
+        local values = {1.7548164498488041, -1.7548164498488041,
+            0.3228308021868589, 0.8728984955928709, 0.6,
+            1.0000000000000002, 0.9999999999999999,
+            2.2250738585072014e-308, 5e-324, 1.7976931348623157e308, -0.0}
+        local bits = {}
+        for i, value in ipairs(values) do
+            local packed = string.pack('>d', value)
+            bits[i] = (packed:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+        end
+        plum.config.set('graph', {values=values, bits=bits})
+        plum.presets.save('Exact graph', {values=values, bits=bits})
+    "#;
+    let h = host(Some(&dir), 1, "");
+    h.run("=save-exact-graph", source).unwrap();
+    drop(h);
+    let preset = dir.join("presets/Exact graph.json");
+    let original = std::fs::read(&preset).unwrap();
+    // Real file deserialization in fresh VMs; repeated load/save must not
+    // accumulate rounding error or replace a subnormal/negative zero.
+    for _ in 0..3 {
+        let h = host(Some(&dir), 1, "");
+        h.run("=verify-exact-graph", r#"
+            local function verify(data)
+                for i, value in ipairs(data.values) do
+                    local packed = string.pack('>d', value)
+                    local bits = (packed:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+                    assert(bits == data.bits[i], 'graph number changed at index ' .. i)
+                end
+            end
+            verify(plum.config.get('graph'))
+            local graph = plum.presets.load('Exact graph')
+            verify(graph)
+            plum.presets.save('Exact graph', graph)
+        "#).unwrap();
+        assert_eq!(std::fs::read(&preset).unwrap(), original);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn caught_oversized_config_changes_preserve_both_scopes_and_persisted_data() {
+    let dir = temp("atomic-size");
+    let (doc, mut hist) = project(vec![]);
+    let h = host(Some(&dir), 1, "");
+    h.set_world(Some(world(&doc, &mut hist)));
+    h.run(
+        "=bounded-config",
+        r#"
+        local block = string.rep('x', 600000)
+        for _, scope in ipairs({plum.config, plum.config.project}) do
+            scope.set('keep', block)
+            scope.set('original', 'small')
+            for i=1,3 do
+                assert(not pcall(scope.set, 'rejected'..i, block))
+                assert(scope.get('rejected'..i)==nil, 'rejected insertion changed config')
+            end
+            assert(not pcall(scope.set, 'original', block))
+            assert(scope.get('original')=='small', 'rejected replacement changed config')
+            assert(scope.get('keep')==block)
+        end
+    "#,
+    )
+    .unwrap();
+    let stored = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(stored.len() <= super::config::MAX_BYTES + 128);
+    assert!(!stored.contains("rejected"));
+    let out = h.take_plugin_out();
+    let data = out.project_data.expect("accepted project settings persist");
+    assert!(data.len() <= super::config::MAX_BYTES + 128);
+    assert!(!data.contains("rejected"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn nested_alias_config_conversion_has_a_cumulative_limit_before_publication() {
+    let dir = temp("alias-size");
+    let h = host(Some(&dir), 1, "");
+    // Four references to one512KiB string: small, finite reproduction, not OOM.
+    let value = h
+        .lua
+        .load("local s=string.rep('x', 524288); local a={s,s}; return {a,a}")
+        .eval::<mlua::Value>()
+        .unwrap();
+    assert!(
+        super::config::to_json(&value, 0).is_err(),
+        "Native conversion must reject the cumulative serialized size before constructing the entire expanded JSON"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stored_file_and_directory_limits_preserve_sources_and_do_not_return_partial_lists() {
+    let dir = temp("stored-limits");
+    let preset_dir = dir.join("presets");
+    std::fs::create_dir_all(&preset_dir).unwrap();
+    let oversized = "x".repeat(super::config::MAX_BYTES + 1);
+    let stored = serde_json::json!({"version":1,"values":{"large":oversized}}).to_string();
+    std::fs::write(dir.join("config.json"), &stored).unwrap();
+    std::fs::write(preset_dir.join("Oversized.json"), &stored).unwrap();
+    let (doc, mut hist) = project(vec![("test.cfg".into(), stored.clone())]);
+    let h = host(Some(&dir), 1, "");
+    h.set_world(Some(world(&doc, &mut hist)));
+    h.run(
+        "=bounded-load",
+        r#"
+        assert(plum.config.get('large')==nil)
+        assert(plum.config.project.get('large')==nil)
+        local ok,err=pcall(plum.presets.load,'Oversized')
+        assert(not ok and tostring(err):find('size limit'))
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        stored
+    );
+    assert_eq!(
+        std::fs::read_to_string(preset_dir.join("Oversized.json")).unwrap(),
+        stored
+    );
+    std::fs::remove_file(preset_dir.join("Oversized.json")).unwrap();
+    for i in 0..super::config::MAX_PRESETS {
+        std::fs::write(preset_dir.join(format!("P{i:04}.json")), "{}").unwrap();
+    }
+    std::fs::write(preset_dir.join("README.txt"), "not a preset").unwrap();
+    h.run("=max-presets", "assert(#plum.presets.list()==1000)")
+        .unwrap();
+    std::fs::write(preset_dir.join("Extra.json"), "{}").unwrap();
+    let error = h
+        .run("=too-many-presets", "return plum.presets.list()")
+        .unwrap_err();
+    assert_eq!(error.category, Category::Runtime);
+    assert!(error.message.contains("listing limit"));
+    assert_eq!(
+        std::fs::read_to_string(preset_dir.join("Extra.json")).unwrap(),
+        "{}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn conversion_budget_counts_json_escapes_and_preserves_exact_boundary_values() {
+    let h = host(None, 1, "");
+    for (script, valid) in [
+        ("return string.rep('x',1048574)", true), // JSON quotes are two bytes.
+        ("return string.rep('x',1048575)", false),
+        ("return string.rep(string.char(0),174762)", true), // Six-byte JSON escape.
+        ("return string.rep(string.char(0),174763)", false),
+        ("return {a=string.rep('x',1048568)}", true),
+        ("return {a=string.rep('x',1048569)}", false),
+    ] {
+        let value = h.lua.load(script).eval::<mlua::Value>().unwrap();
+        let result = super::config::to_json(&value, 0);
+        assert_eq!(result.is_ok(), valid, "{script}");
+        if let Ok(json) = result {
+            assert!(serde_json::to_vec(&json).unwrap().len() <= super::config::MAX_BYTES);
+        }
+    }
+}
+
+#[test]
 fn older_layouts_migrate_and_newer_or_damaged_files_are_left_alone() {
     let dir = temp("migrate");
     std::fs::write(

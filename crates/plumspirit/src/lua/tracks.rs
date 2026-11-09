@@ -178,6 +178,7 @@ pub fn add_methods<M: UserDataMethods<LuaHandle>>(m: &mut M) {
                 Resolved::Project(d) => d.project().name.clone(),
                 Resolved::Track { track, .. } => track.name().unwrap_or("").to_owned(),
                 Resolved::Folder(f) => f.name.clone(),
+                Resolved::Group(g) => g.name.clone().unwrap_or_default(),
                 Resolved::Subchannel { sub, .. } => sub
                     .name
                     .clone()
@@ -194,6 +195,7 @@ pub fn add_methods<M: UserDataMethods<LuaHandle>>(m: &mut M) {
             Ok(match r {
                 Resolved::Track { track, .. } => i64::from(track.id().0),
                 Resolved::Folder(f) => i64::from(f.id),
+                Resolved::Group(g) => i64::from(g.id),
                 Resolved::Subchannel { sub, .. } => i64::from(sub.id.0),
                 Resolved::Content(c) => i64::from(c.id.0),
                 _ => return Err(not_for("id", &this.0)),
@@ -338,6 +340,33 @@ pub fn add_methods<M: UserDataMethods<LuaHandle>>(m: &mut M) {
     });
 
     // --- subchannels
+    m.add_method("note_color", |lua, this, velocity: Value| {
+        with_world(lua, &this.0, |w, r| {
+            let Resolved::Subchannel { sub, .. } = r else {
+                return Err(not_for("note_color", &this.0));
+            };
+            let velocity = match velocity {
+                Value::Nil => 100,
+                Value::Integer(v @ 1..=127) => v as u8,
+                _ => {
+                    return Err(super::stop(
+                        super::Category::Runtime,
+                        "note_color([velocity]) needs an integer velocity from1through127.",
+                    ));
+                }
+            };
+            let color = w
+                .info
+                .note_palette
+                .entry(sub.id.0, velocity, w.info.dark)
+                .fill;
+            let out = lua.create_table_with_capacity(0, 3)?;
+            out.set("r", color.r())?;
+            out.set("g", color.g())?;
+            out.set("b", color.b())?;
+            Ok(out)
+        })
+    });
     m.add_method("number", |lua, this, ()| {
         with_world(lua, &this.0, |_, r| match r {
             Resolved::Subchannel { sub, .. } => Ok(sub.id.number() as i64),

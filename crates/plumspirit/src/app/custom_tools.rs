@@ -51,6 +51,11 @@ pub struct CustomToolSession {
     pub decl: ToolDecl,
     pub values: Vec<ToolValue>,
     pub preview: bool,
+    pub stroke: Option<std::sync::Arc<crate::lua::drawing::Captured>>,
+    pub stroke_overlay: Vec<(u64, f64)>,
+    pub stroking: bool,
+    stroke_rev: u64,
+    stroke_target: Option<NoteTarget>,
     generation: u64,
     /// The inputs of the newest request and its generation.
     requested: Option<(String, u64)>,
@@ -160,7 +165,7 @@ pub fn values_from_json(decl: &ToolDecl, j: &Json) -> (Vec<ToolValue>, Vec<Strin
                 .filter(|n| n >= min && n <= max)
                 .map(|n| ToolValue::Int(n as i64)),
             ToolParamKind::Seed => v.as_i64().map(ToolValue::Int),
-            ToolParamKind::Text { max_len } => v
+            ToolParamKind::Text { max_len, .. } => v
                 .as_str()
                 .filter(|s| s.chars().count() <= *max_len)
                 .map(|s| ToolValue::Text(s.to_owned())),
@@ -230,6 +235,11 @@ impl CustomToolSession {
             decl,
             values,
             preview: true,
+            stroke: None,
+            stroke_overlay: Vec::new(),
+            stroking: false,
+            stroke_rev: 0,
+            stroke_target: None,
             generation: 0,
             requested: None,
             result: None,
@@ -246,6 +256,30 @@ impl CustomToolSession {
         s
     }
 
+    pub fn capture_mode(&self) -> Option<crate::piano_roll::CaptureMode> {
+        self.decl
+            .freehand
+            .then_some(crate::piano_roll::CaptureMode::FreehandOrdered)
+    }
+    fn key_params(&self) -> String {
+        let params = params_literal(&self.decl, &self.values);
+        if self.decl.freehand {
+            format!("{params}|stroke:{}", self.stroke_rev)
+        } else {
+            params
+        }
+    }
+    fn clear_stroke(&mut self) {
+        self.stroke = None;
+        self.stroke_overlay.clear();
+        self.stroking = false;
+        self.stroke_target = None;
+        self.stroke_rev = self.stroke_rev.wrapping_add(1);
+        self.requested = None;
+        self.result = None;
+        self.applying = None;
+        self.generation += 1;
+    }
     fn reload_presets(&mut self, config: Option<&std::path::Path>) {
         self.presets.clear();
         if let Some(d) = preset_dir(config, &self.plugin, &self.decl.id)
@@ -289,6 +323,104 @@ pub fn custom_preview(
 pub type CustomMenu = Vec<(String, String, Vec<(String, String, String)>)>;
 
 impl PlumSpiritApp {
+    /// Completed strokes use the existing roll capture and plugin worker. Partial
+    /// samples are a bounded native overlay, never per-pointer Lua callbacks.
+    pub(super) fn custom_stroke(
+        &mut self,
+        points: &[(u64, f64, f64)],
+        done: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some((target, _, _, track, content)) = self.custom_target() else {
+            return;
+        };
+        let Some(s) = self.custom_tool.as_ref() else {
+            return;
+        };
+        let plugin = s.plugin.clone();
+        let allowed = self.note_lock().is_none()
+            && self.settings.lua_plugins.run_plugins
+            && self
+                .lua_plugins
+                .as_ref()
+                .and_then(|m| m.plugin(&plugin))
+                .is_some_and(|p| {
+                    let state = self.settings.lua_plugins.installed.get(&plugin);
+                    state.is_some_and(|s| s.enabled)
+                        && p.effective(state)
+                            .contains(&crate::lua::Capability::DrawingTools)
+                });
+        if !allowed {
+            self.cancel_custom_stroke();
+            return;
+        }
+        let shift = self.edit_shift();
+        let snap = self.snap_ticks();
+        let keys = self
+            .doc()
+            .map_or(128, |d| u16::from(d.project().keys.max_pitch()) + 1);
+        let ppq = self
+            .doc()
+            .and_then(|d| d.division().musical_ppqn())
+            .unwrap_or(960);
+        let mods = ctx.input(|i| i.modifiers);
+        let Some(s) = self.custom_tool.as_mut() else {
+            return;
+        };
+        if !s.decl.freehand || s.applying.is_some() {
+            return;
+        }
+        if !s.stroking {
+            s.clear_stroke();
+            s.stroking = true;
+            if let Some(m) = self.lua_plugins.as_mut() {
+                m.cancel(&plugin);
+            }
+        }
+        s.stroke_target = Some(target);
+        s.stroke_overlay = points
+            .iter()
+            .take(plumspirit_engine::transform::MAX_STROKE_POINTS)
+            .map(|&(t, p, _)| (t, p))
+            .collect();
+        if done {
+            s.stroking = false;
+            s.stroke_rev = s.stroke_rev.wrapping_add(1);
+            match crate::lua::drawing::Captured::new(
+                points,
+                track,
+                content,
+                shift,
+                keys,
+                ppq,
+                snap,
+                [mods.shift, mods.ctrl, mods.alt, mods.command],
+            ) {
+                Ok(input) => {
+                    s.stroke = Some(input);
+                    s.status = "Stroke captured. Inspect Preview, then Apply.".into();
+                    s.error = None;
+                }
+                Err(e) => {
+                    s.clear_stroke();
+                    s.error = Some(e);
+                }
+            }
+        } else {
+            s.status = "Capturing stroke; Lua runs after release.".into();
+        }
+    }
+    pub(super) fn cancel_custom_stroke(&mut self) {
+        if let Some(s) = self.custom_tool.as_mut()
+            && s.decl.freehand
+        {
+            s.clear_stroke();
+            s.status = "Stroke canceled; project unchanged.".into();
+            if let Some(m) = self.lua_plugins.as_mut() {
+                m.cancel(&s.plugin);
+            }
+        }
+    }
     /// Tools → Custom: every ready plugin's tools.
     pub(super) fn custom_tool_menu(&self) -> CustomMenu {
         let Some(m) = &self.lua_plugins else {
@@ -329,6 +461,17 @@ impl PlumSpiritApp {
             );
             return;
         };
+        if decl.freehand
+            && !p
+                .effective(self.settings.lua_plugins.installed.get(plugin))
+                .contains(&crate::lua::Capability::DrawingTools)
+        {
+            self.set_status(
+                "This tool needs the Piano Roll drawing tools permission (tools.draw).",
+                StatusKind::Warning,
+            );
+            return;
+        }
         let name = p.name();
         // Built-in tool windows and a custom one never preview at once.
         self.tool = None;
@@ -364,8 +507,22 @@ impl PlumSpiritApp {
         ))
     }
 
+    /// Project plugin settings are outside musical history. A retained preview
+    /// pins its source Arc, so release it before the native settings writer needs
+    /// unique access. Generation fencing also discards a late in-flight reply.
+    pub(super) fn custom_project_data_staged(&mut self) {
+        if let Some(s) = self.custom_tool.as_mut() {
+            s.clear_stroke();
+            s.status = "Project plugin settings changed; waiting for a fresh preview.".into();
+        }
+    }
+
     /// Requests a run (`preview`) for the current inputs.
     fn request_custom_run(&mut self, preview: bool, dark: bool) {
+        // Do not repin the old source while project data waits for unique access.
+        if !self.lua_project_data.is_empty() {
+            return;
+        }
         let Some((target, notes_rev, state, track, content)) = self.custom_target() else {
             return;
         };
@@ -377,8 +534,12 @@ impl PlumSpiritApp {
         let Some(s) = self.custom_tool.as_mut() else {
             return;
         };
+        if s.decl.freehand && (s.stroke.is_none() || s.stroking || s.stroke_target != Some(target))
+        {
+            return;
+        }
         let params = params_literal(&s.decl, &s.values);
-        let key = inputs_key(&params, state, target, notes_rev);
+        let key = inputs_key(&s.key_params(), state, target, notes_rev);
         s.generation += 1;
         let generation = s.generation;
         let seed = s
@@ -393,6 +554,7 @@ impl PlumSpiritApp {
             })
             .unwrap_or(1);
         let job = ToolJob {
+            stroke: s.stroke.clone(),
             tool: s.decl.id.clone(),
             params,
             track,
@@ -461,7 +623,7 @@ impl PlumSpiritApp {
                 let Some((target, ..)) = self.custom_target() else {
                     return;
                 };
-                let slot = result_slot(key, commits, target, generation);
+                let slot = result_slot(key, commits, target);
                 let Some(s) = self.custom_tool.as_mut() else {
                     return;
                 };
@@ -509,9 +671,19 @@ impl PlumSpiritApp {
                 if let Some(s) = self.custom_tool.as_mut() {
                     s.status = format!("Applied ({label}). Undo takes it back.");
                     s.requested = None;
+                    if s.decl.freehand {
+                        s.clear_stroke();
+                    }
                 }
             }
             Err(crate::lua::tx::CommitError::ProjectChanged) => {
+                if let Some(s) = self.custom_tool.as_mut()
+                    && s.decl.freehand
+                {
+                    s.clear_stroke();
+                    s.error = Some("The project changed after Preview; draw a new stroke.".into());
+                    return;
+                }
                 // The project moved on since the preview: run once more.
                 if let Some(s) = self.custom_tool.as_mut() {
                     s.status =
@@ -540,26 +712,62 @@ impl PlumSpiritApp {
                 .as_ref()
                 .and_then(|m| m.plugin(&s.plugin))
                 .is_some_and(|p| {
-                    p.status == Status::Ready && p.decls.tools.iter().any(|t| t.id == s.decl.id)
+                    p.status == Status::Ready
+                        && p.decls.tools.iter().any(|t| t.id == s.decl.id)
+                        && (!s.decl.freehand
+                            || p.effective(self.settings.lua_plugins.installed.get(&s.plugin))
+                                .contains(&crate::lua::Capability::DrawingTools))
                 })
         });
         if !alive {
+            if self.custom_tool.as_ref().is_some_and(|s| s.decl.freehand) {
+                self.roll.cancel_gesture();
+            }
             self.custom_tool = None;
             return;
         }
-        // Live preview: request a run when the inputs changed.
-        let want_preview = self
+        if self
             .custom_tool
             .as_ref()
-            .is_some_and(|s| s.preview && s.applying.is_none());
+            .is_some_and(|s| s.decl.freehand && s.stroking)
+            && !ctx.input(|i| i.focused)
+        {
+            self.cancel_custom_stroke();
+            self.roll.cancel_gesture();
+        }
+        let current_target = self.edit_target();
+        let current_shift = self.edit_shift();
+        let current_keys = self
+            .doc()
+            .map_or(128, |d| u16::from(d.project().keys.max_pitch()) + 1);
+        if let Some(s) = self.custom_tool.as_mut()
+            && s.decl.freehand
+            && (s.stroke_target.is_some_and(|t| t != current_target)
+                || s.stroke
+                    .as_ref()
+                    .is_some_and(|v| v.shift != current_shift || v.keys != current_keys))
+        {
+            s.clear_stroke();
+        }
+        if self.note_lock().is_some() && self.custom_tool.as_ref().is_some_and(|s| s.decl.freehand)
+        {
+            if let Some(s) = self.custom_tool.take()
+                && let Some(m) = self.lua_plugins.as_mut()
+            {
+                m.cancel(&s.plugin);
+            }
+            self.roll.cancel_gesture();
+            return;
+        }
+        // Live preview: request a run when the inputs changed.
+        let want_preview = self.custom_tool.as_ref().is_some_and(|s| {
+            s.preview
+                && s.applying.is_none()
+                && (!s.decl.freehand || (s.stroke.is_some() && !s.stroking))
+        });
         if want_preview && let Some((target, notes_rev, state, ..)) = self.custom_target() {
             let s = self.custom_tool.as_ref().expect("checked");
-            let key = inputs_key(
-                &params_literal(&s.decl, &s.values),
-                state,
-                target,
-                notes_rev,
-            );
+            let key = inputs_key(&s.key_params(), state, target, notes_rev);
             if s.requested.as_ref().is_none_or(|(k, _)| *k != key) {
                 self.request_custom_run(true, dark);
             }
@@ -593,8 +801,20 @@ impl PlumSpiritApp {
                     );
                     want_help |= super::help::help_button(ui, "lua-plugins");
                 });
+                if s.decl.freehand {
+                    ui.label("Draw in the Piano Roll, inspect Preview, then Apply. Each Apply is one Undo step.");
+                    ui.label("Escape cancels the active stroke. A new stroke replaces an unapplied stroke.");
+                    if ui.add_enabled(s.stroke.is_some() || s.stroking,egui::Button::new("Clear stroke")).clicked() {action=Some(UiAction::ClearStroke);}
+                }
                 ui.separator();
-                param_form(ui, &s.decl.params, &mut s.values, keys);
+                // Match native tools: parameters scroll, action footer remains reachable.
+                let screen=ui.ctx().content_rect();
+                let room=screen.bottom()-ui.cursor().top()-170.;
+                egui::ScrollArea::vertical()
+                    .id_salt("custom-tool-parameters")
+                    .max_height(room.clamp(80.,(screen.height()*0.55).max(80.)))
+                    .auto_shrink([false,true])
+                    .show(ui,|ui|param_form(ui,&s.decl.params,&mut s.values,keys));
                 ui.separator();
                 if s.decl.needs_selection && !has_selection {
                     ui.colored_label(ui.visuals().warn_fg_color, "Select notes first: this tool works on the selection.");
@@ -607,7 +827,7 @@ impl PlumSpiritApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut s.preview, "Preview")
                         .on_hover_text("Shows the result in the Piano Roll before you apply it (the project is not changed).");
-                    let can = !s.decl.needs_selection || has_selection;
+                    let can = (!s.decl.needs_selection || has_selection) && (!s.decl.freehand || (s.stroke.is_some() && !s.stroking));
                     if ui
                         .add_enabled(can && s.applying.is_none(), egui::Button::new("Apply"))
                         .on_hover_text("Applies the result as one Undo step.")
@@ -673,7 +893,19 @@ impl PlumSpiritApp {
 
     fn custom_tool_action(&mut self, a: UiAction, config: Option<&std::path::Path>, dark: bool) {
         match a {
+            UiAction::ClearStroke => {
+                self.roll.cancel_gesture();
+                if let Some(s) = self.custom_tool.as_mut() {
+                    s.clear_stroke();
+                    if let Some(m) = self.lua_plugins.as_mut() {
+                        m.cancel(&s.plugin);
+                    }
+                }
+            }
             UiAction::Close => {
+                if self.custom_tool.as_ref().is_some_and(|s| s.decl.freehand) {
+                    self.roll.cancel_gesture();
+                }
                 if let Some(s) = self.custom_tool.take()
                     && let Some(m) = self.lua_plugins.as_mut()
                 {
@@ -681,20 +913,26 @@ impl PlumSpiritApp {
                 }
             }
             UiAction::Apply => {
+                if !self.lua_project_data.is_empty() {
+                    self.custom_project_data_staged();
+                    return;
+                }
                 let current = self
                     .custom_target()
                     .and_then(|(target, notes_rev, state, ..)| {
                         let s = self.custom_tool.as_ref()?;
-                        let key = inputs_key(
-                            &params_literal(&s.decl, &s.values),
-                            state,
-                            target,
-                            notes_rev,
-                        );
+                        let key = inputs_key(&s.key_params(), state, target, notes_rev);
                         Some(s.result.as_ref().is_some_and(|r| r.key == key))
                     });
                 if current == Some(true) {
                     self.apply_custom_result();
+                } else if self.custom_tool.as_ref().is_some_and(|s| s.decl.freehand) {
+                    if let Some(s) = self.custom_tool.as_mut() {
+                        s.error = Some(
+                            "Preview is not current. Wait for a new Preview before Apply.".into(),
+                        );
+                    }
+                    self.request_custom_run(true, dark);
                 } else {
                     self.request_custom_run(false, dark);
                 }
@@ -846,12 +1084,11 @@ pub fn check_tool_chord(
 }
 
 /// The result notes of `target` in `commits`' result as a drawn preview.
-fn result_slot(
-    key: String,
-    commits: Commits,
-    target: NoteTarget,
-    generation: u64,
-) -> ToolResultSlot {
+fn result_slot(key: String, commits: Commits, target: NoteTarget) -> ToolResultSlot {
+    // A per-session worker generation can repeat when another tool opens. The
+    // renderer identity must be unique across all custom results in this process.
+    static NEXT_PREVIEW: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0x4c55_4100_0000_0000);
     let mut notes = Vec::new();
     let mut max_dur = 0;
     let mut too_many = false;
@@ -874,12 +1111,13 @@ fn result_slot(
         notes,
         max_dur,
         // A new identity per result (the roll caches drawings by it).
-        rev: 0x4c55_4100_0000_0000 | generation,
+        rev: NEXT_PREVIEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         too_many,
     }
 }
 
 enum UiAction {
+    ClearStroke,
     Apply,
     Close,
     SavePreset,
@@ -1065,8 +1303,18 @@ fn param_control(
                 std::mem::swap(&mut f.velocity.0, &mut f.velocity.1);
             }
         }
-        (ToolParamKind::Text { max_len }, ToolValue::Text(s)) => {
-            ui.add(egui::TextEdit::singleline(s).char_limit(*max_len));
+        (ToolParamKind::Text { max_len, multiline }, ToolValue::Text(s)) => {
+            if *multiline {
+                ui.add(
+                    egui::TextEdit::multiline(s)
+                        .id(ui.id().with(("lua_multiline", i)))
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .char_limit(*max_len),
+                );
+            } else {
+                ui.add(egui::TextEdit::singleline(s).char_limit(*max_len));
+            }
         }
         (_, v) => {
             // A value that does not match its kind (never stored): reset.
@@ -1100,6 +1348,7 @@ mod tests {
             name: "T".into(),
             tooltip: String::new(),
             needs_selection: true,
+            freehand: false,
             params: vec![
                 p(
                     "n",
@@ -1312,4 +1561,8 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+    include!("custom_drawing_tests.rs");
+    include!("image_art_studio_tests.rs");
+    include!("text_art_studio_tests.rs");
+    include!("midi_input_laboratory_app_tests.rs");
 }

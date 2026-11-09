@@ -1,8 +1,11 @@
 # Lua Plugins and Custom Tools
 
+PlumSpirit v1.0.1 supports Lua API 0.2.0 and existing API 0.1 plugins.
+
 Community plugins are Lua 5.4 scripts that add **commands** and **custom note tools**. They
-run inside PlumSpirit in a sandbox: no files, network or programs, bounded memory and time,
-and nothing they did not ask for and you did not allow.
+run inside PlumSpirit with bounded memory and time. Plugins receive only the capabilities
+you grant. Files require your selection; there is no unrestricted filesystem, network or
+program access.
 
 ## Installing a plugin
 
@@ -14,9 +17,10 @@ and nothing they did not ask for and you did not allow.
    notes**, **edit tracks**, **edit the Conductor**, **read / write a file you pick**.
 4. Tick the box beside its name to enable it. Nothing is allowed or enabled by installing.
 
-**Examples**: PlumSpirit ships two — **Graph Shift** (a note tool that shifts notes by a
-graph) and **CC Batch** (controller curves and LFOs across the selection). Install them from
-the window's Examples row, then read their `main.lua` in the plugins folder.
+**Examples**: PlumSpirit ships 22 authored examples, including the original **Graph Shift**
+and **CC Batch**, **Custom Graph Laboratory**, **Custom Drawing Studio**, **Image Art Studio**
+and **Text Art Studio**. Install them from the window's Examples menu, then read their
+`main.lua` in the plugins folder. Installing an example grants no capabilities.
 
 ## Using plugins
 
@@ -25,8 +29,15 @@ the window's Examples row, then read their `main.lua` in the plugins folder.
   **Cancel**.
 * Custom tools: **Tools → Custom** and the note menu → **Custom**. They preview live in the
   Piano Roll and apply as one Undo step, like built-in tools, with presets and shortcuts.
-* Every change a plugin makes goes through a transaction: one Undo step, all or nothing. A
-  plugin that fails changes nothing.
+* Drawing tools capture a stroke in the Piano Roll, then process it on a worker. Preview
+  the notes before Apply; Escape cancels the active stroke. Existing native Draw/Paint and
+  the original curve editor remain available.
+* Musical edits go through transactions and the existing Undo history. Failed processing
+  discards private staging. Saving a selected external file is a separate explicit action
+  outside musical Undo; check the plugin's description before running it.
+* API 0.2 plugins may provide custom panels, graphs, image/text artwork, editor overlays,
+  format adapters, reactive observers or composed services. Playback and live MIDI input
+  need their own capabilities; each MIDI input device also needs explicit approval.
 
 ## Managing plugins
 

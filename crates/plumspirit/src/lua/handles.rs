@@ -35,6 +35,10 @@ pub struct World {
     pub doc: Arc<PlumDocument>,
     pub ids: IncarnationSnapshot,
     pub info: Arc<ProjectInfo>,
+    /// Nonzero for private transaction group handles; never persisted.
+    pub(super) group_scope: u64,
+    pub(super) run: u64,
+    pub(super) group_origin_floor: u32,
 }
 
 /// Where the open project came from (`project:file_type()`).
@@ -71,6 +75,8 @@ pub struct ProjectInfo {
     pub revision: u64,
     /// The dark theme is on (automatic track colors depend on it).
     pub dark: bool,
+    /// Immutable native note palette captured for this run, never a UI callback.
+    pub note_palette: Arc<crate::ui::theme::NotePalette>,
     /// Track ids whose subtracks are collapsed in the Track List, sorted.
     pub collapsed: Vec<u32>,
     /// The active track (the Piano Roll's), the Track List's selected tracks
@@ -79,6 +85,11 @@ pub struct ProjectInfo {
     pub selected_tracks: Vec<TrackId>,
     pub selected_clips: Vec<ClipId>,
     pub time_selection: Option<(u64, u64)>,
+    /// Immutable native transport facts captured with this run, never a live pointer.
+    pub playback: Option<super::playback::Snapshot>,
+    /// Opaque native worker preparation resources, never converted into Lua values.
+    pub playback_resources: Option<crate::audio::midi_overlay::Resources>,
+    pub views: [Option<super::visual::Snapshot>; 2],
 }
 
 /// The object a handle names.
@@ -92,6 +103,8 @@ pub enum Target {
     Track(TrackId),
     /// A Track Folder (ids from 1).
     Folder(u32),
+    /// A project-wide native note group.
+    Group { id: u32, scope: u64 },
     /// A clip placement (a primary clip is its track's own content).
     Clip(ClipId),
     /// A clip content the project owns (linked clips share one).
@@ -117,12 +130,47 @@ pub enum Target {
 }
 
 /// A stable reference to one object of one open project.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Handle {
     project: ProjectSerial,
     target: Target,
     /// The incarnation of the id the handle depends on (see `ledger_key`).
     incarnation: u32,
+    birth: Option<Arc<super::tx::BirthFence>>,
+    // Only native custom-tool content targets bind an editing context. Ordinary
+    // API0.1 content handles keep their existing first-placement interpretation.
+    content_owner: Option<(TrackId, u32)>,
+}
+
+impl PartialEq for Handle {
+    fn eq(&self, other: &Self) -> bool {
+        self.project == other.project
+            && self.target == other.target
+            && self.incarnation == other.incarnation
+    }
+}
+impl Eq for Handle {}
+fn attach_birth(lua: &mlua::Lua, mut h: Handle) -> mlua::Result<Handle> {
+    let track = match h.target {
+        Target::Track(id) | Target::Clip(ClipId::Primary(id)) | Target::Subchannel(id, _) => {
+            Some(id)
+        }
+        Target::Note {
+            host: ContentRef::Track(id),
+            ..
+        }
+        | Target::Event {
+            host: ContentRef::Track(id),
+            ..
+        } => Some(id),
+        _ => None,
+    };
+    if let Some(id) = track
+        && let Some(mut slot) = lua.app_data_mut::<super::tx::TxSlot>()
+    {
+        h.birth = slot.track_birth(lua, id)?;
+    }
+    Ok(h)
 }
 
 /// What a valid handle resolves to.
@@ -134,6 +182,7 @@ pub enum Resolved<'a> {
         track: &'a Track,
     },
     Folder(&'a FolderInfo),
+    Group(&'a plumspirit_engine::model::GroupInfo),
     Clip(ClipPlacement),
     Content(&'a OwnedContent),
     Subchannel {
@@ -164,6 +213,7 @@ fn ledger_key(t: &Target) -> Option<IdKey> {
         Target::Project | Target::Conductor => None,
         Target::Track(id) | Target::Clip(ClipId::Primary(id)) => Some((IdKind::Track, 0, id.0)),
         Target::Folder(f) => Some((IdKind::Folder, 0, *f)),
+        Target::Group { id, .. } => Some((IdKind::Group, 0, *id)),
         Target::Clip(ClipId::Placed(n)) => Some((IdKind::Clip, 0, *n)),
         Target::Content(c) => Some((IdKind::Content, 0, c.0)),
         Target::Subchannel(t, s) => Some((IdKind::Subchannel, t.0, s.0)),
@@ -187,6 +237,9 @@ impl World {
         World {
             doc,
             ids,
+            group_scope: 0,
+            run: 0,
+            group_origin_floor: u32::MAX,
             info: Arc::new(ProjectInfo {
                 dark: true,
                 ..ProjectInfo::default()
@@ -209,6 +262,8 @@ impl World {
             project: self.ids.project(),
             target,
             incarnation: ledger_key(&target).map_or(0, |k| self.ids.of(k)),
+            birth: None,
+            content_owner: None,
         }
     }
 
@@ -233,6 +288,16 @@ impl World {
         Some(self.make(Target::Track(id)))
     }
 
+    pub fn group(&self, id: u32) -> Option<Handle> {
+        self.doc.project().groups.get(id)?;
+        let scope = if id >= self.group_origin_floor {
+            self.group_scope
+        } else {
+            0
+        };
+        Some(self.make(Target::Group { id, scope }))
+    }
+
     pub fn folder(&self, id: u32) -> Option<Handle> {
         self.doc.project().folders.get(id)?;
         Some(self.make(Target::Folder(id)))
@@ -246,6 +311,22 @@ impl World {
     pub fn content(&self, id: ContentId) -> Option<Handle> {
         self.doc.clips().content(id)?;
         Some(self.make(Target::Content(id)))
+    }
+
+    pub(super) fn content_on_track(&self, id: ContentId, track: TrackId) -> Option<Handle> {
+        self.doc.track_by_id(track)?;
+        if !self
+            .doc
+            .clips()
+            .explicit_placements()
+            .iter()
+            .any(|p| p.track == track && p.content == ContentRef::Owned(id))
+        {
+            return None;
+        }
+        let mut handle = self.content(id)?;
+        handle.content_owner = Some((track, self.ids.of((IdKind::Track, 0, track.0))));
+        Some(handle)
     }
 
     pub fn subchannel(&self, track: TrackId, id: SubchannelId) -> Option<Handle> {
@@ -298,6 +379,7 @@ impl Handle {
             Target::Conductor => "conductor",
             Target::Track(_) => "track",
             Target::Folder(_) => "folder",
+            Target::Group { .. } => "group",
             Target::Clip(_) => "clip",
             Target::Content(_) => "clip_content",
             Target::Subchannel(..) => "subchannel",
@@ -317,6 +399,7 @@ impl Handle {
             Target::Conductor => format!("conductor:{p}"),
             Target::Track(t) => format!("track:{p}:{}.{i}", t.0),
             Target::Folder(f) => format!("folder:{p}:{f}.{i}"),
+            Target::Group { id, scope } => format!("group:{p}:{id}.{i}@{scope}"),
             Target::Clip(ClipId::Primary(t)) => format!("clip:{p}:t{}.{i}", t.0),
             Target::Clip(ClipId::Placed(n)) => format!("clip:{p}:{n}.{i}"),
             Target::Content(c) => format!("clip_content:{p}:{}.{i}", c.0),
@@ -341,13 +424,26 @@ impl Handle {
         }
     }
 
+    pub(super) fn content_host(&self) -> Option<TrackId> {
+        self.content_owner.map(|(track, _)| track)
+    }
+
     /// Resolves the handle in `w`, or says (as a sentence) why it is expired.
     pub fn resolve<'a>(&self, w: &'a World) -> Result<Resolved<'a>, String> {
+        if self.birth.as_ref().is_some_and(|f| !f.valid_in(w.run)) {
+            return Err("This handle belongs to an abandoned transaction; reacquire it from the current project.".into());
+        }
         if self.project != w.ids.project() {
             return Err(format!(
                 "This {} handle belongs to a project that is no longer open; get a new handle from the current project.",
                 self.family_words()
             ));
+        }
+        if let Target::Group { scope, .. } = self.target
+            && scope != 0
+            && scope != w.group_scope
+        {
+            return Err("This group handle belongs to a closed transaction; reacquire it from the current project.".into());
         }
         if let Some(k) = ledger_key(&self.target)
             && w.ids.of(k) != self.incarnation
@@ -355,6 +451,21 @@ impl Handle {
             return Err(self.gone());
         }
         let doc = &*w.doc;
+        if let Some((track, incarnation)) = self.content_owner {
+            let Target::Content(content) = self.target else {
+                return Err(self.gone());
+            };
+            if w.ids.of((IdKind::Track, 0, track.0)) != incarnation
+                || doc.track_by_id(track).is_none()
+                || !doc
+                    .clips()
+                    .explicit_placements()
+                    .iter()
+                    .any(|p| p.track == track && p.content == ContentRef::Owned(content))
+            {
+                return Err("This tool's clip editing track is expired; reopen the tool on the current clip.".into());
+            }
+        }
         let r = match self.target {
             Target::Project => Some(Resolved::Project(doc)),
             Target::Conductor => Some(Resolved::Conductor(doc)),
@@ -363,6 +474,7 @@ impl Handle {
                 track: &doc.tracks()[index],
             }),
             Target::Folder(f) => doc.project().folders.get(f).map(Resolved::Folder),
+            Target::Group { id, .. } => doc.project().groups.get(id).map(Resolved::Group),
             Target::Clip(id) => doc.clips().placement(id).map(Resolved::Clip),
             Target::Content(c) => doc.clips().content(c).map(Resolved::Content),
             Target::Subchannel(t, s) => doc.index_of(t).and_then(|index| {
@@ -451,6 +563,7 @@ pub(super) struct Granted(pub Arc<std::collections::BTreeSet<super::Capability>>
 /// Fails with the `capability` category unless the plugin may read the
 /// project (every read of the project through a handle).
 pub fn require_read(lua: &mlua::Lua) -> mlua::Result<()> {
+    super::reactive::check_read(lua)?;
     let granted = lua
         .app_data_ref::<Granted>()
         .map(|g| Arc::clone(&g.0))
@@ -518,7 +631,7 @@ pub fn handle_list(
 ) -> mlua::Result<mlua::Table> {
     let t = lua.create_table()?;
     for (i, h) in hs.into_iter().enumerate() {
-        t.raw_set(i + 1, LuaHandle(h))?;
+        t.raw_set(i + 1, LuaHandle(attach_birth(lua, h)?))?;
     }
     Ok(t)
 }
@@ -526,7 +639,9 @@ pub fn handle_list(
 /// `h` as a Lua value (nil for `None`).
 pub fn handle_or_nil(lua: &mlua::Lua, h: Option<Handle>) -> mlua::Result<mlua::Value> {
     match h {
-        Some(h) => lua.create_userdata(LuaHandle(h)).map(mlua::Value::UserData),
+        Some(h) => lua
+            .create_userdata(LuaHandle(attach_birth(lua, h)?))
+            .map(mlua::Value::UserData),
         None => Ok(mlua::Value::Nil),
     }
 }
@@ -574,6 +689,7 @@ impl UserData for LuaHandle {
         super::tracks::add_methods(m);
         super::clips::add_methods(m);
         super::notes::add_methods(m);
+        super::tx::groups::add_read_methods(m);
         super::events::add_methods(m);
         super::timing::add_methods(m);
     }

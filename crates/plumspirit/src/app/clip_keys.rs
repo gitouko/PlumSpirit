@@ -166,6 +166,7 @@ impl PlumSpiritApp {
         }
         let what = match c {
             Command::Delete => "Delete",
+            Command::Cut => "Cut",
             Command::Copy => "Copy",
             Command::SliceNotes => "Slice",
             Command::OpenTool("duplicate") => "Duplicate",

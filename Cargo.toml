@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/plumspirit_engine", "crates/plumspirit"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -26,3 +26,7 @@ opt-level = 2
 
 [profile.bench]
 debug = false
+
+[patch.crates-io]
+# Existing locked Harfrust, additive native completion-status accessor only.
+harfrust = { path = "third_party/harfrust-0.12.0" }

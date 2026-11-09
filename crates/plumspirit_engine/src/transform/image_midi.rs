@@ -22,6 +22,8 @@
 
 use super::paste::{ColorInfo, ColorNote, Generated};
 use super::rng::Rng;
+#[path = "image_runs.rs"]
+pub mod runs;
 
 /// Largest decoded picture (pixels) the plugin accepts.
 pub const MAX_PIXELS: u64 = 64 * 1024 * 1024;
@@ -71,41 +73,89 @@ pub fn check_size(w: u32, h: u32) -> Result<(), String> {
 
 /// Area-weighted box-filter resize (premultiplied by coverage, RGBA averaged).
 pub fn box_resize(src: &Rgba, nw: u32, nh: u32) -> Rgba {
+    box_resize_controlled(src, nw, nh, |_, _, _| Ok(()), || Ok(()))
+        .expect("Image resize allocation failed")
+}
+
+/// The same box filter, with allocation preflight and cooperative checkpoints.
+/// `before` receives output dimensions and an upper bound on temporary span bytes
+/// (excluding output pixels). No output or span storage is allocated before it.
+/// The caller enforces its own dimensional/workspace quotas; native conversion
+/// deliberately retains its historical wider time-axis limits.
+pub fn box_resize_controlled(
+    src: &Rgba,
+    nw: u32,
+    nh: u32,
+    mut before: impl FnMut(u32, u32, usize) -> Result<(), String>,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<Rgba, String> {
     let (nw, nh) = (nw.max(1), nh.max(1));
+    let identity = nw == src.w && nh == src.h;
+    let scratch = if identity {
+        0
+    } else {
+        let axes = u64::from(nw) + u64::from(nh);
+        // Each axis partitions its source range. At most two partial source
+        // cells per output span are added to the source cells' total count.
+        let entries = u64::from(src.w) + u64::from(src.h) + 2 * axes;
+        usize::try_from(
+            axes * std::mem::size_of::<Vec<(u32, f64)>>() as u64
+                + entries * std::mem::size_of::<(u32, f64)>() as u64,
+        )
+        .map_err(|_| "Image resize workspace overflows this platform.".to_string())?
+    };
+    check()?;
+    before(nw, nh, scratch)?;
+    let mut px = pixel_buffer(nw, nh)?;
     if nw == src.w && nh == src.h {
-        return src.clone();
+        for row in src.px.chunks(src.w as usize) {
+            check()?;
+            px.extend_from_slice(row);
+        }
+        return Ok(Rgba { w: nw, h: nh, px });
     }
     let sx = f64::from(src.w) / f64::from(nw);
     let sy = f64::from(src.h) / f64::from(nh);
     // Per output column: the source columns it covers with their weights.
-    let spans = |n: u32, scale: f64, len: u32| -> Vec<Vec<(u32, f64)>> {
-        (0..n)
-            .map(|i| {
-                let a = f64::from(i) * scale;
-                let b = (f64::from(i) + 1.0) * scale;
-                let mut v = Vec::new();
-                let mut s = a.floor() as u32;
-                while f64::from(s) < b && s < len {
-                    let lo = a.max(f64::from(s));
-                    let hi = b.min(f64::from(s) + 1.0);
-                    if hi > lo {
-                        v.push((s, hi - lo));
-                    }
-                    s += 1;
+    let mut spans = |n: u32, scale: f64, len: u32| -> Result<Vec<Vec<(u32, f64)>>, String> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(n as usize)
+            .map_err(|_| "memory: image resize spans could not be allocated".to_string())?;
+        for i in 0..n {
+            check()?;
+            let a = f64::from(i) * scale;
+            let b = (f64::from(i) + 1.0) * scale;
+            let mut v = Vec::new();
+            let mut s = a.floor() as u32;
+            let end = (b.ceil() as u32).min(len);
+            v.try_reserve_exact(end.saturating_sub(s) as usize)
+                .map_err(|_| "memory: image resize span could not be allocated".to_string())?;
+            while f64::from(s) < b && s < len {
+                let lo = a.max(f64::from(s));
+                let hi = b.min(f64::from(s) + 1.0);
+                if hi > lo {
+                    v.push((s, hi - lo));
                 }
-                v
-            })
-            .collect()
+                s += 1;
+            }
+            out.push(v);
+        }
+        Ok(out)
     };
-    let xs = spans(nw, sx, src.w);
-    let ys = spans(nh, sy, src.h);
-    let mut px = Vec::with_capacity(nw as usize * nh as usize);
+    let xs = spans(nw, sx, src.w)?;
+    let ys = spans(nh, sy, src.h)?;
+    let mut work = 0usize;
     for yspan in &ys {
+        check()?;
         for xspan in &xs {
             let mut acc = [0.0f64; 4];
             let mut wsum = 0.0;
             for &(y, wy) in yspan {
                 for &(x, wx) in xspan {
+                    if work.is_multiple_of(65_536) {
+                        check()?;
+                    }
+                    work = work.wrapping_add(1);
                     let p = src.at(x, y);
                     let w = wx * wy;
                     for c in 0..4 {
@@ -123,7 +173,16 @@ pub fn box_resize(src: &Rgba, nw: u32, nh: u32) -> Rgba {
             px.push(o);
         }
     }
-    Rgba { w: nw, h: nh, px }
+    Ok(Rgba { w: nw, h: nh, px })
+}
+
+fn pixel_buffer(w: u32, h: u32) -> Result<Vec<[u8; 4]>, String> {
+    let count = usize::try_from(u64::from(w) * u64::from(h))
+        .map_err(|_| "Image pixel count overflows this platform.".to_string())?;
+    let mut px = Vec::new();
+    px.try_reserve_exact(count)
+        .map_err(|_| "memory: image pixels could not be allocated".to_string())?;
+    Ok(px)
 }
 
 /// Geometric changes applied to the picture before conversion.
@@ -160,12 +219,37 @@ impl ImageTransform {
 /// to the nearest source pixel; the canvas grows to hold the rotated picture
 /// and uncovered pixels are transparent.
 pub fn transform(src: &Rgba, t: &ImageTransform) -> Result<Rgba, String> {
+    transform_controlled(src, t, |_, _, _| Ok(()), || Ok(()))
+}
+
+/// Existing inverse mapping with caller allocation preflight and cancellation.
+/// The temporary byte count is zero: this operation only allocates output pixels.
+pub fn transform_controlled(
+    src: &Rgba,
+    t: &ImageTransform,
+    mut before: impl FnMut(u32, u32, usize) -> Result<(), String>,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<Rgba, String> {
+    check()?;
     if t.is_identity() {
-        return Ok(src.clone());
+        before(src.w, src.h, 0)?;
+        let mut px = pixel_buffer(src.w, src.h)?;
+        for row in src.px.chunks(src.w as usize) {
+            check()?;
+            px.extend_from_slice(row);
+        }
+        return Ok(Rgba {
+            w: src.w,
+            h: src.h,
+            px,
+        });
     }
     let (sx, sy) = (t.scale_x, t.scale_y);
     if !(sx.is_finite() && sy.is_finite()) || sx.abs() < 1e-3 || sy.abs() < 1e-3 {
         return Err("The scale must not be zero.".into());
+    }
+    if !t.rotate.is_finite() {
+        return Err("The rotation must be finite.".into());
     }
     let fx = if (sx < 0.0) != t.flip_x { -1.0 } else { 1.0 };
     let fy = if (sy < 0.0) != t.flip_y { -1.0 } else { 1.0 };
@@ -180,10 +264,12 @@ pub fn transform(src: &Rgba, t: &ImageTransform) -> Result<Rgba, String> {
         ));
     }
     let (nw, nh) = (nw as u32, nh as u32);
+    before(nw, nh, 0)?;
     let (cx, cy) = (f64::from(nw) / 2.0, f64::from(nh) / 2.0);
     let (scx, scy) = (sw / 2.0, sh / 2.0);
-    let mut px = Vec::with_capacity(nw as usize * nh as usize);
+    let mut px = pixel_buffer(nw, nh)?;
     for y in 0..nh {
+        check()?;
         for x in 0..nw {
             // Destination pixel centre relative to the centre, rotated back.
             let dx = f64::from(x) + 0.5 - cx;
@@ -503,20 +589,8 @@ pub fn prepare(src: &Rgba, s: &Settings) -> Result<Rgba, String> {
 
 /// Palette index of every pixel of `img` (`u32::MAX` = transparent / ignored).
 pub fn index_pixels(img: &Rgba, s: &Settings) -> Vec<u32> {
-    img.px
-        .iter()
-        .map(|p| {
-            if p[3] < s.alpha_min || s.palette.is_empty() {
-                return u32::MAX;
-            }
-            let k = nearest(&s.palette, [p[0], p[1], p[2]]);
-            if s.ignored.get(k).copied().unwrap_or(false) {
-                u32::MAX
-            } else {
-                k as u32
-            }
-        })
-        .collect()
+    runs::index_controlled(img, s, |_| Ok(()), || Ok(()))
+        .expect("Image palette index allocation failed")
 }
 
 /// The display colour of palette entry `k`.
@@ -550,69 +624,45 @@ fn hsv(c: [f64; 3]) -> [u8; 3] {
 /// sentence when more than `limit` notes would be made (counted while
 /// forming them, before they are stored).
 pub fn convert(img: &Rgba, s: &Settings, limit: usize) -> Result<Generated, String> {
-    let idx = index_pixels(img, s);
+    let idx = runs::index_controlled(img, s, |_| Ok(()), || Ok(()))?;
     let tpp = s.ticks_per_pixel.max(1);
     let vel = s.velocity.clamp(1, 127);
     let mut notes: Vec<ColorNote> = Vec::new();
-    // Lines along time: (key, pixel indices in time order).
-    let (lines, len) = match s.orientation {
-        Orientation::PianoRoll => (img.h, img.w),
-        Orientation::Upstream => (img.w, img.h),
-    };
-    let at = |line: u32, t: u32| -> u32 {
-        match s.orientation {
-            // Row 0 = the highest key.
-            Orientation::PianoRoll => idx[(line as usize) * img.w as usize + t as usize],
-            // Column = key; time runs from the bottom row upwards.
-            Orientation::Upstream => {
-                idx[((img.h - 1 - t) as usize) * img.w as usize + line as usize]
-            }
-        }
-    };
-    let key_of = |line: u32| -> u8 {
-        match s.orientation {
-            Orientation::PianoRoll => s.last_key - line as u8,
-            Orientation::Upstream => s.first_key + line as u8,
-        }
-    };
-    for line in 0..lines {
-        let key = key_of(line);
-        let mut t = 0u32;
-        while t < len {
-            let c = at(line, t);
-            if c == u32::MAX {
-                t += 1;
-                continue;
-            }
-            let start = t;
-            t += 1;
-            if !s.pixel_notes {
-                while t < len && at(line, t) == c {
-                    if s.max_len > 0 {
-                        let cut = match s.split {
-                            SplitFrom::ImageStart => t.is_multiple_of(s.max_len),
-                            SplitFrom::NoteStart => t - start >= s.max_len,
-                        };
-                        if cut {
-                            break;
-                        }
-                    }
-                    t += 1;
+    let mut cursor = runs::Cursor::new(&idx, img.w, img.h, s)?;
+    let (lines, _) = cursor.dimensions();
+    if lines > 256
+        || (s.orientation == Orientation::PianoRoll && lines > u32::from(s.last_key) + 1)
+        || (s.orientation == Orientation::Upstream && u32::from(s.first_key) + lines > 256)
+    {
+        return Err("The processed picture extends beyond its native key range.".into());
+    }
+    loop {
+        let count = cursor.visit_controlled(
+            &idx,
+            runs::MAX_BATCH,
+            |run| {
+                if notes.len() >= limit {
+                    return Err(format!(
+                        "The picture would make more than {} notes; lower the resolution or the palette size.",
+                        crate::midi::group_digits(limit as u64)
+                    ));
                 }
-            }
-            if notes.len() >= limit {
-                return Err(format!(
-                    "The picture would make more than {} notes; lower the resolution or the palette size.",
-                    crate::midi::group_digits(limit as u64)
-                ));
-            }
-            notes.push(ColorNote {
-                start: u64::from(start) * tpp,
-                dur: u64::from(t - start) * tpp,
-                pitch: key,
-                vel,
-                color: c,
-            });
+                notes.push(ColorNote {
+                    start: u64::from(run.start) * tpp,
+                    dur: u64::from(run.length) * tpp,
+                    pitch: match s.orientation {
+                        Orientation::PianoRoll => s.last_key - run.line as u8,
+                        Orientation::Upstream => s.first_key + run.line as u8,
+                    },
+                    vel,
+                    color: run.color,
+                });
+                Ok(())
+            },
+            || Ok(()),
+        )?;
+        if count == 0 {
+            break;
         }
     }
     let colors = (0..s.palette.len())
@@ -656,6 +706,71 @@ mod tests {
         let c = box_resize(&a, 1, 1);
         assert_eq!(c.px, vec![[128, 0, 128, 255]]);
         assert_eq!(box_resize(&a, 4, 2), a);
+    }
+
+    #[test]
+    fn controlled_image_operations_preflight_and_cancel_inside_work() {
+        use std::cell::Cell;
+        let a = img(1024, 1024, |_, _| R);
+        let checks = Cell::new(0);
+        let called = Cell::new(false);
+        let error = box_resize_controlled(
+            &a,
+            1,
+            1,
+            |w, h, scratch| {
+                assert_eq!((w, h), (1, 1));
+                assert!(scratch >= 2048 * std::mem::size_of::<(u32, f64)>());
+                called.set(true);
+                Ok(())
+            },
+            || {
+                checks.set(checks.get() + 1);
+                // Initial, X/Y span, row and first source-pixel checkpoints
+                // precede the next check inside this million-pixel output cell.
+                if checks.get() == 6 {
+                    Err("cancel inside sample accumulation".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(called.get());
+        assert_eq!(checks.get(), 6);
+        assert_eq!(error, "cancel inside sample accumulation");
+        assert_eq!(a.at(0, 0), R);
+
+        let error = transform_controlled(
+            &a,
+            &ImageTransform::default(),
+            |w, h, scratch| {
+                assert_eq!((w, h, scratch), (1024, 1024, 0));
+                Err("quota before allocation".into())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "quota before allocation");
+        let checks = Cell::new(0);
+        let error = transform_controlled(
+            &a,
+            &ImageTransform {
+                flip_x: true,
+                ..Default::default()
+            },
+            |_, _, _| Ok(()),
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 {
+                    Err("cancel inside mapping".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "cancel inside mapping");
     }
 
     #[test]

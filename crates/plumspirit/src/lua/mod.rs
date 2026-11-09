@@ -27,22 +27,40 @@
 // The plugin manager and the API families (B1-S52 on) are its callers.
 #![allow(dead_code)]
 
+pub mod bridge;
 pub mod clips;
 pub mod config;
 pub mod custom;
+pub mod drawing;
 pub mod events;
 pub mod examples;
+pub mod files;
+pub(crate) mod format_review;
+pub mod formats;
+pub mod geometry;
 pub mod handles;
+pub mod images;
+pub mod midi_input;
 pub mod notes;
+pub mod overlays;
 pub mod package;
+pub mod playback;
 pub mod plugin_api;
 pub mod plugins;
 pub mod project;
+pub mod reactive;
+pub mod response;
 pub mod selection;
+pub mod service_calls;
+pub mod services;
+pub mod structured;
+pub mod text;
 pub mod ticks;
 pub mod timing;
 pub mod tracks;
 pub mod tx;
+pub mod ui;
+pub mod visual;
 pub mod worker;
 
 pub use handles::{Handle, LuaHandle, World};
@@ -59,9 +77,9 @@ use std::time::{Duration, Instant};
 /// The scripting API's version (semantic versioning, `docs/LUA_API.md`
 /// "Versions"): a script written for `major.minor` runs on any host of the
 /// same major and an equal or later minor; a major change may break scripts.
-pub const API_VERSION: (u32, u32, u32) = (0, 1, 0);
+pub const API_VERSION: (u32, u32, u32) = (0, 2, 0);
 
-/// The API version as `plum.api_version` shows it ("0.1.0").
+/// The API version as `plum.api_version` shows it ("0.2.0").
 pub fn api_version() -> String {
     let (a, b, c) = API_VERSION;
     format!("{a}.{b}.{c}")
@@ -74,6 +92,16 @@ pub const CHECK_EVERY: u32 = 10_000;
 /// (`docs/LUA_API.md` "Capabilities"). The names are stable API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
+    /// Receive completed strokes from an explicitly selected Piano Roll drawing tool.
+    DrawingTools,
+    /// Read captured native transport state and receive bounded observations.
+    ReadPlayback,
+    /// Request bounded native transport actions from explicit invocations.
+    ControlPlayback,
+    /// Send bounded authored MIDI to isolated internal playback voices.
+    EmitMidi,
+    /// Enumerate MIDI inputs and request explicit per-device job-scoped consent.
+    ReadMidiInput,
     /// Read the project: tracks, clips, notes, events, Conductor, selection.
     ReadProject,
     /// Change notes and controller events (through Preview / Undo).
@@ -86,16 +114,45 @@ pub enum Capability {
     ReadUserFile,
     /// Write a file the user picks in a dialog.
     WriteUserFile,
+    /// Receive bounded, worker-delivered project observations.
+    ObserveProject,
+    /// Request bounded automatic transactions from project events.
+    AutomateProject,
+    /// Publish bounded plain-data services.
+    ProvideServices,
+    /// Consume declared bounded services in other plugins.
+    CallServices,
+    /// Change this plugin's sparse project attributes through Undo.
+    EditMetadata,
+    /// Enumerate and load installed font faces from host font directories.
+    ListFonts,
+    /// Open explicitly invoked declarative panels and bounded canvas surfaces.
+    UiPanels,
+    /// Read authorized native view geometry and use bounded view overlays.
+    UiOverlay,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 19] = [
         Capability::ReadProject,
         Capability::EditNotes,
         Capability::EditTracks,
         Capability::EditConductor,
         Capability::ReadUserFile,
         Capability::WriteUserFile,
+        Capability::ObserveProject,
+        Capability::AutomateProject,
+        Capability::ProvideServices,
+        Capability::CallServices,
+        Capability::EditMetadata,
+        Capability::ListFonts,
+        Capability::UiPanels,
+        Capability::UiOverlay,
+        Capability::DrawingTools,
+        Capability::ReadPlayback,
+        Capability::ControlPlayback,
+        Capability::EmitMidi,
+        Capability::ReadMidiInput,
     ];
 
     /// The name scripts and manifests use.
@@ -107,6 +164,19 @@ impl Capability {
             Capability::EditConductor => "conductor.edit",
             Capability::ReadUserFile => "file.read_user_choice",
             Capability::WriteUserFile => "file.write_user_choice",
+            Capability::ObserveProject => "project.observe",
+            Capability::AutomateProject => "project.automate",
+            Capability::ProvideServices => "services.provide",
+            Capability::CallServices => "services.call",
+            Capability::EditMetadata => "metadata.edit",
+            Capability::ListFonts => "fonts.list",
+            Capability::UiPanels => "ui.panels",
+            Capability::UiOverlay => "ui.overlay",
+            Capability::DrawingTools => "tools.draw",
+            Capability::ReadPlayback => "playback.read",
+            Capability::ControlPlayback => "playback.control",
+            Capability::EmitMidi => "playback.emit_midi",
+            Capability::ReadMidiInput => "midi.input",
         }
     }
 
@@ -157,6 +227,102 @@ pub struct Progress {
     /// 0 – 1, or `None` before the script reports.
     pub fraction: Option<f64>,
     pub message: String,
+}
+
+pub const MAX_DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
+pub const MAX_PRINT_LINES: usize = 1000;
+pub const MAX_PRINT_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct OutputBuffer {
+    lines: Vec<String>,
+    bytes: usize,
+}
+impl OutputBuffer {
+    fn check_room(&self, bytes: usize) -> mlua::Result<()> {
+        if self.lines.len() >= MAX_PRINT_LINES
+            || self
+                .bytes
+                .checked_add(bytes)
+                .and_then(|n| n.checked_add(1))
+                .is_none_or(|n| n > MAX_PRINT_BYTES)
+        {
+            return Err(stop(
+                Category::Budget,
+                "The plugin's print output budget was used up; reduce diagnostic output.",
+            ));
+        }
+        Ok(())
+    }
+    fn push(&mut self, line: String) -> mlua::Result<()> {
+        self.check_room(line.len())?;
+        self.lines
+            .try_reserve(1)
+            .map_err(|_| stop(Category::Memory, "Unable to reserve diagnostic output."))?;
+        self.bytes += line.len() + 1;
+        self.lines.push(line);
+        Ok(())
+    }
+}
+
+fn print_line(args: &[Value], stringify: &mlua::Function) -> mlua::Result<String> {
+    fn append(line: &mut String, text: &str) -> mlua::Result<()> {
+        if line
+            .len()
+            .checked_add(text.len())
+            .is_none_or(|n| n > MAX_DIAGNOSTIC_LINE_BYTES)
+        {
+            return Err(stop(
+                Category::Budget,
+                "A print line exceeds the 16 KiB diagnostic limit.",
+            ));
+        }
+        line.try_reserve(text.len())
+            .map_err(|_| stop(Category::Memory, "Unable to reserve a diagnostic line."))?;
+        line.push_str(text);
+        Ok(())
+    }
+    fn string(line: &mut String, value: &mlua::LuaString) -> mlua::Result<()> {
+        // Check borrowed Lua bytes before any potentially expanding lossy copy.
+        if value.as_bytes().len() > MAX_DIAGNOSTIC_LINE_BYTES {
+            return Err(stop(
+                Category::Budget,
+                "A print line exceeds the 16 KiB diagnostic limit.",
+            ));
+        }
+        let bytes = value.as_bytes();
+        append(line, &String::from_utf8_lossy(&bytes))
+    }
+    let mut line = String::new();
+    for (i, value) in args.iter().enumerate() {
+        if i != 0 {
+            append(&mut line, "\t")?;
+        }
+        match value {
+            Value::String(s) => string(&mut line, s)?,
+            Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => {
+                append(&mut line, &value.to_string()?)?;
+            }
+            other => match stringify.call::<mlua::LuaString>(other.clone()) {
+                Ok(s) if s.to_str().is_ok() => string(&mut line, &s)?,
+                _ => append(&mut line, other.type_name())?,
+            },
+        }
+    }
+    Ok(line)
+}
+
+/// Clip bounded host diagnostics without splitting UTF-8 or copying a huge input.
+fn diagnostic_text(text: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= limit {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    const SUFFIX: &str = " [truncated]";
+    let mut end = limit.saturating_sub(SUFFIX.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{SUFFIX}", &text[..end]))
 }
 
 /// Why a script failed (stable API: scripts and error reports use the
@@ -422,12 +588,24 @@ impl Plain {
 /// running script through it, without waiting for one to end. Holds only weak
 /// references to the hosts' cancel flags.
 #[derive(Clone, Default)]
-pub struct Scripts(Arc<Mutex<Vec<std::sync::Weak<AtomicBool>>>>);
+pub struct Scripts(
+    Arc<Mutex<Vec<std::sync::Weak<AtomicBool>>>>,
+    Arc<Mutex<Vec<std::sync::Weak<AtomicU64>>>>,
+);
 
 impl Scripts {
     /// Follows `host` (its runs are canceled by [`Scripts::cancel_all`]).
     pub fn add(&self, host: &Host) {
         self.add_flag(&host.cancel);
+        if let Some(s) = host.lua.app_data_ref::<playback::midi::Slot>() {
+            self.add_midi_epoch(&s.cancel_epoch);
+        }
+    }
+    pub(crate) fn add_midi_epoch(&self, epoch: &Arc<AtomicU64>) {
+        if let Ok(mut v) = self.1.lock() {
+            v.retain(|w| w.strong_count() > 0);
+            v.push(Arc::downgrade(epoch));
+        }
     }
 
     /// Follows a host's cancel flag (a host on a script worker's thread).
@@ -442,6 +620,14 @@ impl Scripts {
     /// next check with the `canceled` category. Returns how many hosts were
     /// told. O(hosts); never blocks on a script.
     pub fn cancel_all(&self) -> usize {
+        if let Ok(mut v) = self.1.lock() {
+            v.retain(|w| w.strong_count() > 0);
+            for w in v.iter() {
+                if let Some(e) = w.upgrade() {
+                    e.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
         let Ok(mut v) = self.0.lock() else {
             return 0;
         };
@@ -470,7 +656,7 @@ pub struct Host {
     time_override_ns: AtomicU64,
     epoch: Instant,
     /// What `print` wrote.
-    output: Arc<Mutex<Vec<String>>>,
+    output: Arc<Mutex<OutputBuffer>>,
     /// What the last successful run committed ([`Host::take_commits`]).
     commits: Mutex<Option<tx::Commits>>,
     /// Instructions the current run executed (in steps of [`CHECK_EVERY`]).
@@ -494,6 +680,9 @@ pub struct PluginOut {
     pub notes: Vec<String>,
     /// `plum.ui.notify` messages.
     pub notices: Vec<(String, plugin_api::NoticeKind)>,
+    pub response_request: Option<response::Request>,
+    pub loop_intent: Option<playback::loop_intent::Intent>,
+    pub midi_intent: Option<playback::midi::Intent>,
 }
 
 impl Host {
@@ -516,7 +705,7 @@ impl Host {
             )),
             time_override_ns: AtomicU64::new(0),
             epoch: Instant::now(),
-            output: Arc::new(Mutex::new(Vec::new())),
+            output: Arc::new(Mutex::new(OutputBuffer::default())),
             commits: Mutex::new(None),
             ui: Mutex::new(None),
             plugin_out: Mutex::new(PluginOut::default()),
@@ -529,6 +718,21 @@ impl Host {
         host.lua.set_app_data(tx::TxSlot::default());
         host.lua.set_app_data(selection::UiSlot::default());
         host.lua.set_app_data(timing::IndexCache::default());
+        host.lua.set_app_data(bridge::Session::default());
+        host.lua.set_app_data(drawing::Slot::default());
+        host.lua.set_app_data(bridge::NativeBudget::default());
+        host.lua.set_app_data(files::FileSlot::default());
+        host.lua.set_app_data(images::ImageSlot::default());
+        host.lua.set_app_data(text::TextSlot::default());
+        host.lua.set_app_data(reactive::Scope::default());
+        host.lua.set_app_data(playback::control::Slot::default());
+        host.lua
+            .set_app_data(playback::loop_intent::Slot::default());
+        host.lua.set_app_data(playback::plan::Slot::default());
+        host.lua.set_app_data(playback::midi::Slot::default());
+        host.lua.set_app_data(visual::Slot::default());
+        host.lua.set_app_data(overlays::Slot::default());
+        host.lua.set_app_data(ui::images::RetainedSlot::default());
         host.lua.set_app_data(notes::Budget {
             cancel: Arc::clone(&host.cancel),
             deadline: Arc::clone(&host.deadline),
@@ -549,6 +753,8 @@ impl Host {
     /// Makes this host a plugin's: installs `plum.plugin` (identity,
     /// registrations, `include`) for `meta` (B1-0038).
     pub fn set_plugin(&self, meta: plugin_api::PluginMeta) -> Result<(), ScriptError> {
+        self.lua
+            .set_app_data(bridge::NativeBudget::for_plugin(&meta.id));
         plugin_api::install(&self.lua, meta).map_err(|e| classify(&e))
     }
 
@@ -605,7 +811,7 @@ impl Host {
     pub fn take_output(&self) -> Vec<String> {
         self.output
             .lock()
-            .map(|mut o| std::mem::take(&mut *o))
+            .map(|mut o| std::mem::take(&mut *o).lines)
             .unwrap_or_default()
     }
 
@@ -634,8 +840,29 @@ impl Host {
         let now = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.deadline
             .store(now.saturating_add(budget).max(1), Ordering::SeqCst);
+        notes::end_automatic_run(&self.lua);
+        service_calls::begin_run(&self.lua);
+        response::begin_run(&self.lua);
         tx::begin_run(&self.lua);
         selection::begin_run(&self.lua);
+        bridge::begin_run(
+            &self.lua,
+            Duration::from_nanos(budget),
+            Arc::clone(&self.cancel),
+        );
+        files::begin_run(&self.lua);
+        midi_input::begin_run(&self.lua);
+        images::end_run(&self.lua);
+        text::end_run(&self.lua);
+        playback::control::begin_run(&self.lua);
+        playback::loop_intent::begin_run(&self.lua);
+        playback::plan::end_run(&self.lua);
+        playback::midi::begin_run(&self.lua);
+        visual::begin_run(&self.lua);
+        ui::begin_run(&self.lua);
+        ui::images::begin_retained_run(&self.lua);
+        overlays::begin_run(&self.lua);
+        drawing::begin_run(&self.lua);
         self.executed.store(0, Ordering::SeqCst);
         if let Ok(mut p) = self.progress.lock() {
             *p = Progress::default();
@@ -643,15 +870,40 @@ impl Host {
         if let Ok(mut c) = self.commits.lock() {
             *c = None;
         }
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut result = catch_unwind(AssertUnwindSafe(|| {
             self.lua
                 .load(source)
                 .set_name(format!("@{file}"))
                 .set_mode(ChunkMode::Text)
                 .eval::<Value>()
-                .map(|v| Plain::of(&v))
+                .and_then(|v| {
+                    reactive::check_read(&self.lua)?;
+                    notes::check_budget(&self.lua)?;
+                    Ok(Plain::of(&v))
+                })
         }));
+        if let Err(e) = ui::end_run(&self.lua) {
+            result = Ok(Err(e));
+        }
+        if let Err(e) = overlays::end_run(&self.lua, matches!(result, Ok(Ok(_)))) {
+            result = Ok(Err(e));
+        }
+        ui::images::end_retained_run(&self.lua, matches!(result, Ok(Ok(_))));
+        let loop_intent = playback::loop_intent::end_run(&self.lua, matches!(result, Ok(Ok(_))));
+        let midi_intent = playback::midi::end_run(&self.lua, matches!(result, Ok(Ok(_))));
+        playback::control::end_run(&self.lua);
+        playback::plan::end_run(&self.lua);
+        drawing::end_run(&self.lua);
+        images::end_run(&self.lua);
+        text::end_run(&self.lua);
+        if let Err(e) = formats::end_run(&self.lua, matches!(result, Ok(Ok(_)))) {
+            result = Ok(Err(e));
+        }
+        files::end_run(&self.lua);
+        midi_input::end_run(&self.lua);
+        bridge::end_run(&self.lua);
         self.deadline.store(0, Ordering::SeqCst);
+        notes::end_automatic_run(&self.lua);
         let ok = matches!(result, Ok(Ok(_)));
         let commits = tx::end_run(&self.lua, ok);
         if let Ok(mut u) = self.ui.lock() {
@@ -666,6 +918,9 @@ impl Host {
             *p = PluginOut {
                 project_data,
                 notes,
+                response_request: response::end_run(&self.lua, ok),
+                loop_intent,
+                midi_intent,
                 notices: if ok { notices } else { Vec::new() },
             };
         }
@@ -793,23 +1048,20 @@ impl Host {
         g.set("collectgarbage", gc)?;
         // print → the host's output.
         let out = Arc::clone(&self.output);
+        let stringify: mlua::Function = g.get("tostring")?;
         let print = self
             .lua
-            .create_function(move |_, args: mlua::Variadic<Value>| {
-                let line = args
-                    .iter()
-                    .map(|v| match v {
-                        Value::String(s) => s.to_string_lossy(),
-                        other => other
-                            .to_string()
-                            .unwrap_or_else(|_| other.type_name().into()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\t");
-                if let Ok(mut o) = out.lock() {
-                    o.push(line);
-                }
-                Ok(())
+            .create_function(move |lua, args: mlua::Variadic<Value>| {
+                notes::check_budget(lua)?;
+                out.lock()
+                    .map_err(|_| stop(Category::Internal, "Diagnostic output is unavailable."))?
+                    .check_room(0)?;
+                // __tostring can call print recursively: never hold the mutex
+                // while invoking Lua, and recheck capacity at publication.
+                let line = print_line(&args, &stringify)?;
+                out.lock()
+                    .map_err(|_| stop(Category::Internal, "Diagnostic output is unavailable."))?
+                    .push(line)
             })?;
         g.set("print", print)?;
         // os: the script's own CPU-independent clock only.
@@ -842,10 +1094,21 @@ impl Host {
         tx::install(&self.lua, &plum)?;
         selection::install(&self.lua, &plum)?;
         timing::install(&self.lua, &plum)?;
+        files::install(&self.lua, &plum)?;
+        images::install(&self.lua, &plum)?;
+        text::install(&self.lua, &plum)?;
+        ui::install(&self.lua, &plum)?;
+        geometry::install(&self.lua, &plum)?;
+        playback::install(&self.lua, &plum)?;
+        midi_input::install(&self.lua, &plum)?;
         let granted = Arc::clone(&self.granted);
         plum.set(
             "capabilities",
             self.lua.create_function(move |lua, ()| {
+                let granted = lua
+                    .app_data_ref::<handles::Granted>()
+                    .map(|g| Arc::clone(&g.0))
+                    .unwrap_or_else(|| Arc::clone(&granted));
                 let t = lua.create_table()?;
                 for cap in Capability::ALL {
                     t.set(cap.name(), granted.contains(&cap))?;
@@ -856,7 +1119,11 @@ impl Host {
         let granted = Arc::clone(&self.granted);
         plum.set(
             "has",
-            self.lua.create_function(move |_, name: String| {
+            self.lua.create_function(move |lua, name: String| {
+                let granted = lua
+                    .app_data_ref::<handles::Granted>()
+                    .map(|g| Arc::clone(&g.0))
+                    .unwrap_or_else(|| Arc::clone(&granted));
                 Ok(Capability::parse(&name).is_some_and(|c| granted.contains(&c)))
             })?,
         )?;
@@ -892,22 +1159,26 @@ impl Host {
         let progress = Arc::clone(&self.progress);
         plum.set(
             "progress",
-            self.lua
-                .create_function(move |lua, (fraction, message): (f64, Option<String>)| {
+            self.lua.create_function(
+                move |lua, (fraction, message): (f64, Option<mlua::LuaString>)| {
                     if !fraction.is_finite() {
                         return Err(stop(
                             Category::Runtime,
                             "plum.progress needs a fraction from 0 to 1.",
                         ));
                     }
+                    let message = message
+                        .map(|m| m.to_str().map(|s| s.chars().take(200).collect::<String>()))
+                        .transpose()?;
                     if let Ok(mut p) = progress.lock() {
                         p.fraction = Some(fraction.clamp(0.0, 1.0));
                         if let Some(m) = message {
-                            p.message = m.chars().take(200).collect();
+                            p.message = m;
                         }
                     }
                     notes::check_budget(lua)
-                })?,
+                },
+            )?,
         )?;
         plum.set(
             "yield",
@@ -987,11 +1258,15 @@ mod config_tests;
 #[cfg(test)]
 mod custom_tests;
 #[cfg(test)]
+mod diagnostic_tests;
+#[cfg(test)]
 mod events_tests;
 #[cfg(test)]
 mod example_tests;
 #[cfg(test)]
 mod handle_tests;
+#[cfg(test)]
+mod note_metadata_tests;
 #[cfg(test)]
 mod notes_tests;
 #[cfg(test)]
@@ -1004,3 +1279,6 @@ mod tests;
 mod tx_tests;
 #[cfg(test)]
 mod worker_tests;
+
+#[cfg(all(test, windows))]
+mod perf_scaling_tests;

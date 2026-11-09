@@ -43,9 +43,12 @@ pub(super) struct Budget {
 /// Fails with the `budget` category when `more` notes would take the run's
 /// transactions past their output budget (`already`: created so far).
 pub fn check_output(lua: &Lua, already: u64, more: u64) -> mlua::Result<()> {
-    let max = lua
+    let mut max = lua
         .app_data_ref::<Budget>()
         .map_or(u64::MAX, |b| b.max_output_notes);
+    if super::reactive::responding(lua) {
+        max = max.min(super::response::MAX_NOTES);
+    }
     if already.saturating_add(more) > max {
         return Err(stop(
             Category::Budget,
@@ -96,6 +99,8 @@ pub struct Filter {
     pub subchannel: Option<u32>,
     pub velocity: (u8, u8),
     pub selected_only: bool,
+    pub group: Option<u32>,
+    pub muted: Option<bool>,
 }
 
 impl Default for Filter {
@@ -108,6 +113,8 @@ impl Default for Filter {
             subchannel: None,
             velocity: (1, 127),
             selected_only: false,
+            group: None,
+            muted: None,
         }
     }
 }
@@ -115,17 +122,21 @@ impl Default for Filter {
 impl Filter {
     /// Only the start range: counts come from chunk lengths.
     fn range_only(&self) -> bool {
-        self.keys == (0, 255)
+        self.group.is_none()
+            && self.muted.is_none()
+            && self.keys == (0, 255)
             && self.channel.is_none()
             && self.subchannel.is_none()
             && self.velocity == (1, 127)
             && !self.selected_only
     }
 
-    fn accepts(&self, r: &NoteRecord) -> bool {
+    pub(super) fn accepts(&self, r: &NoteRecord) -> bool {
         let a = r.attrs;
         let (k, v) = (a.pitch(), a.velocity());
-        k >= self.keys.0
+        self.group.is_none_or(|g| r.group == g)
+            && self.muted.is_none_or(|m| a.muted() == m)
+            && k >= self.keys.0
             && k <= self.keys.1
             && v >= self.velocity.0
             && v <= self.velocity.1
@@ -193,6 +204,15 @@ impl Filter {
                 runtime(format!("subchannel must be a subchannel id; {s} is not."))
             })?);
         }
+        f.group = t
+            .raw_get::<Option<i64>>("group")?
+            .map(|g| u32::try_from(g).map_err(|_| runtime("group must be a nonnegative group ID.")))
+            .transpose()?;
+        f.muted = match t.raw_get::<Value>("muted")? {
+            Value::Nil => None,
+            Value::Boolean(b) => Some(b),
+            _ => return Err(runtime("muted must be a boolean.")),
+        };
         f.selected_only = t.get::<Option<bool>>("selected")?.unwrap_or(false);
         Ok(f)
     }
@@ -239,12 +259,16 @@ pub fn host_of(lua: &Lua, h: &Handle) -> mlua::Result<Host> {
             content: None,
         }),
         Resolved::Content(c) => {
-            let track = w
-                .doc
-                .clips()
-                .placements_of(ContentRef::Owned(c.id))
-                .first()
-                .map(|p| p.track)
+            let track = h
+                .content_host()
+                .or_else(|| {
+                    w.doc
+                        .clips()
+                        .explicit_placements()
+                        .iter()
+                        .find(|p| p.content == ContentRef::Owned(c.id))
+                        .map(|p| p.track)
+                })
                 .ok_or_else(|| runtime("This clip content is on no track."))?;
             Ok(Host {
                 track,
@@ -280,6 +304,7 @@ pub struct Cursor {
     filter: Filter,
     /// The notes' state the ranks belong to.
     pub content_revision: u64,
+    _native: Option<super::bridge::Reservation>,
 }
 
 impl Cursor {
@@ -302,9 +327,30 @@ impl Cursor {
             run: 0,
             filter,
             content_revision: store.content_revision(),
+            _native: None,
         }
     }
 
+    fn accounted(lua: &Lua, store: &NoteStore, filter: Filter) -> mlua::Result<Self> {
+        if !super::reactive::responding(lua) {
+            return Ok(Self::new(store, filter));
+        }
+        check_budget(lua)?;
+        let bytes = store
+            .chunk_count()
+            .saturating_mul(32)
+            .saturating_add(store.selected_count().saturating_mul(64))
+            .saturating_add(16 * 1024);
+        let native = lua
+            .app_data_ref::<super::bridge::NativeBudget>()
+            .ok_or_else(|| stop(Category::Internal, "Native cursor budget is unavailable."))?
+            .reserve(bytes)
+            .map_err(|e| e.lua())?;
+        let mut cursor = Self::new(store, filter);
+        cursor._native = Some(native);
+        check_budget(lua)?;
+        Ok(cursor)
+    }
     fn is_selected(&mut self, rank: usize) -> bool {
         while let Some(&(s, l)) = self.selected.get(self.run) {
             if rank < s {
@@ -360,15 +406,60 @@ fn store_selected_runs(store: &NoteStore) -> Vec<(usize, usize)> {
     }
 }
 
+/// Only automatic iterators are job-scoped. Legacy API01 iterators retain
+/// their established semantics. Weak entries never retain a cursor themselves.
+#[derive(Default)]
+struct AutomaticCursors(Vec<std::sync::Weak<Mutex<Option<Cursor>>>>);
+pub(super) fn end_automatic_run(lua: &Lua) {
+    if let Some(mut cursors) = lua.app_data_mut::<AutomaticCursors>() {
+        for weak in cursors.0.drain(..) {
+            if let Some(state) = weak.upgrade()
+                && let Ok(mut cursor) = state.lock()
+            {
+                *cursor = None;
+            }
+        }
+    }
+}
+fn register_automatic_cursor(lua: &Lua, state: &Arc<Mutex<Option<Cursor>>>) -> mlua::Result<()> {
+    if !super::reactive::responding(lua) {
+        return Ok(());
+    }
+    if lua.app_data_ref::<AutomaticCursors>().is_none() {
+        lua.set_app_data(AutomaticCursors::default());
+    }
+    let mut cursors = lua
+        .app_data_mut::<AutomaticCursors>()
+        .expect("automatic cursor registry");
+    if cursors.0.len() >= 32 {
+        return Err(stop(
+            Category::Budget,
+            "An automatic response may create at most 32 note iterators.",
+        ));
+    }
+    cursors.0.push(Arc::downgrade(state));
+    Ok(())
+}
+
 /// Every note `filter` selects in `store` (budget-checked).
 pub fn collect(lua: &Lua, store: &NoteStore, filter: &Filter) -> mlua::Result<Vec<Hit>> {
-    let mut c = Cursor::new(store, filter.clone());
+    let mut c = Cursor::accounted(lua, store, filter.clone())?;
     let mut out = Vec::new();
     loop {
         let mut budget = CHECK_NOTES;
         loop {
             match c.next_hit(&mut budget) {
-                Ok(Some(h)) => out.push(h),
+                Ok(Some(h)) => {
+                    if super::reactive::responding(lua)
+                        && out.len() >= super::response::MAX_NOTES as usize
+                    {
+                        return Err(stop(
+                            Category::Budget,
+                            "An automatic note mutation query may match at most 100,000 notes.",
+                        ));
+                    }
+                    out.push(h);
+                }
                 Ok(None) => return Ok(out),
                 Err(()) => break,
             }
@@ -386,7 +477,7 @@ pub fn count(lua: &Lua, store: &NoteStore, filter: &Filter) -> mlua::Result<usiz
             None => store.len() - snap.count_in(0, filter.t0),
         });
     }
-    let mut c = Cursor::new(store, filter.clone());
+    let mut c = Cursor::accounted(lua, store, filter.clone())?;
     let mut n = 0;
     loop {
         let mut budget = CHECK_NOTES;
@@ -478,10 +569,12 @@ impl UserData for LuaNoteQuery {
                         runtime(format!("A batch holds 1 - {MAX_BATCH} notes; {n} is not."))
                     })?,
             };
+            let host = host_of(lua, &this.host)?;
             let cursor = resolve(lua, this, |_, _, store| {
-                Ok(Cursor::new(store, this.filter.clone()))
+                Cursor::accounted(lua, store, this.filter.clone())
             })?;
             let state = Arc::new(Mutex::new(Some(cursor)));
+            register_automatic_cursor(lua, &state)?;
             lua.create_function(move |lua, ()| {
                 let mut guard = state
                     .lock()
@@ -517,14 +610,26 @@ impl UserData for LuaNoteQuery {
                 if hits.is_empty() {
                     return Ok(Value::Nil);
                 }
-                batch_table(lua, &hits, columns).map(Value::Table)
+                drop(guard);
+                batch_table(lua, &hits, columns, host).map(Value::Table)
             })
         });
-        m.add_method("each", |lua, this, ()| {
+        m.add_method("each", |lua, this, opts: Option<Table>| {
+            let columns = match opts
+                .as_ref()
+                .map(|t| t.get::<Option<Table>>("columns"))
+                .transpose()?
+                .flatten()
+            {
+                Some(c) => Some(Columns::parse(&c)?),
+                None => None,
+            };
+            let host = host_of(lua, &this.host)?;
             let cursor = resolve(lua, this, |_, _, store| {
-                Ok(Cursor::new(store, this.filter.clone()))
+                Cursor::accounted(lua, store, this.filter.clone())
             })?;
             let state = Arc::new(Mutex::new(Some(cursor)));
+            register_automatic_cursor(lua, &state)?;
             lua.create_function(move |lua, ()| {
                 let mut guard = state
                     .lock()
@@ -535,7 +640,21 @@ impl UserData for LuaNoteQuery {
                 loop {
                     let mut budget = CHECK_NOTES;
                     match c.next_hit(&mut budget) {
-                        Ok(Some(h)) => return note_table(lua, &h).map(Value::Table),
+                        Ok(Some(h)) => {
+                            drop(guard);
+                            if let Some(columns) = columns {
+                                let batch = batch_table(lua, &[h], columns, host)?;
+                                let row = lua.create_table()?;
+                                for (i, name) in Columns::NAMES.iter().enumerate() {
+                                    if columns.has(i) {
+                                        let col: Table = batch.raw_get(*name)?;
+                                        row.raw_set(*name, col.raw_get::<Value>(1)?)?;
+                                    }
+                                }
+                                return Ok(Value::Table(row));
+                            }
+                            return note_table(lua, &h).map(Value::Table);
+                        }
                         Ok(None) => {
                             *guard = None;
                             return Ok(Value::Nil);
@@ -548,7 +667,7 @@ impl UserData for LuaNoteQuery {
         m.add_method("handles", |lua, this, limit: Option<i64>| {
             let limit = limit.unwrap_or(100_000).max(0) as usize;
             resolve(lua, this, |w, host, store| {
-                let mut c = Cursor::new(store, this.filter.clone());
+                let mut c = Cursor::accounted(lua, store, this.filter.clone())?;
                 // Ranks → places: walk the store once in order.
                 let mut ranks = Vec::new();
                 while ranks.len() < limit {
@@ -587,10 +706,10 @@ impl UserData for LuaNoteQuery {
 
 /// Which columns a batch holds (fewer columns: faster batches).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Columns(u8);
+struct Columns(u16);
 
 impl Columns {
-    const NAMES: [&'static str; 8] = [
+    const NAMES: [&'static str; 16] = [
         "start",
         "gate",
         "key",
@@ -599,6 +718,14 @@ impl Columns {
         "subchannel",
         "selected",
         "index",
+        "muted",
+        "off_kind",
+        "off_velocity",
+        "group",
+        "locked",
+        "track_id",
+        "content_id",
+        "host_kind",
     ];
     const ALL: Columns = Columns(0xFF);
 
@@ -607,7 +734,7 @@ impl Columns {
     }
 
     fn parse(t: &Table) -> mlua::Result<Columns> {
-        let mut bits = 0u8;
+        let mut bits = 0u16;
         for name in t.clone().sequence_values::<String>() {
             let name = name?;
             let i = Columns::NAMES
@@ -627,7 +754,7 @@ impl Columns {
 
 /// Struct-of-arrays table of `hits` with the asked `columns` (each built in
 /// one pass with a pre-sized array).
-fn batch_table(lua: &Lua, hits: &[Hit], columns: Columns) -> mlua::Result<Table> {
+fn batch_table(lua: &Lua, hits: &[Hit], columns: Columns, host: Host) -> mlua::Result<Table> {
     let t = lua.create_table_with_capacity(0, 9)?;
     // Ticks past 2^63 - 1 cannot reach a script: refuse the batch once.
     if hits.iter().any(|h| {
@@ -638,6 +765,11 @@ fn batch_table(lua: &Lua, hits: &[Hit], columns: Columns) -> mlua::Result<Table>
         ));
     }
     t.raw_set("count", hits.len() as i64)?;
+    let world = if columns.has(12) {
+        current_world(lua)
+    } else {
+        None
+    };
     let ints = |f: &dyn Fn(&Hit) -> i64| lua.create_sequence_from(hits.iter().map(f));
     for (i, name) in Columns::NAMES.iter().enumerate() {
         if !columns.has(i) {
@@ -651,7 +783,28 @@ fn batch_table(lua: &Lua, hits: &[Hit], columns: Columns) -> mlua::Result<Table>
             4 => ints(&|h| i64::from(h.rec.attrs.channel()))?,
             5 => ints(&|h| i64::from(h.rec.sub.0))?,
             6 => lua.create_sequence_from(hits.iter().map(|h| h.selected))?,
-            _ => ints(&|h| h.rank as i64 + 1)?,
+            7 => ints(&|h| h.rank as i64 + 1)?,
+            8 => lua.create_sequence_from(hits.iter().map(|h| h.rec.attrs.muted()))?,
+            9 => lua.create_sequence_from(hits.iter().map(|h| match h.rec.attrs.off_kind() {
+                plumspirit_engine::model::NoteOffKind::NoteOff => "note_off",
+                plumspirit_engine::model::NoteOffKind::NoteOnZero => "note_on_zero",
+            }))?,
+            10 => ints(&|h| i64::from(h.rec.attrs.off_velocity()))?,
+            11 => ints(&|h| i64::from(h.rec.group))?,
+            12 => lua.create_sequence_from(hits.iter().map(|h| {
+                world
+                    .as_ref()
+                    .is_some_and(|w| w.doc.project().groups.locked(h.rec.group))
+            }))?,
+            13 => ints(&|_| i64::from(host.track.0))?,
+            14 => ints(&|_| host.content.map_or(0, |c| i64::from(c.0)))?,
+            _ => lua.create_sequence_from(hits.iter().map(|_| {
+                if host.content.is_some() {
+                    "clip_content"
+                } else {
+                    "track"
+                }
+            }))?,
         };
         t.raw_set(*name, col)?;
     }
@@ -679,7 +832,7 @@ pub fn add_methods<M: UserDataMethods<LuaHandle>>(m: &mut M) {
         // Checks the handle and the family now, not at first use.
         host_of(lua, &this.0)?;
         Ok(LuaNoteQuery {
-            host: this.0,
+            host: this.0.clone(),
             filter,
         })
     });

@@ -18,7 +18,7 @@ Piano Roll** buttons switch the central area.
 | Open in the Piano Roll | Double-click, or {key:OpenClip} |
 | Duplicate | Alt+drag (linked copies where you drop them), or {key:OpenTool("duplicate")} right after the selection |
 | Slice | {key:SliceNotes} slices the selected clips at the edit cursor (two clips showing the same notes) |
-| Copy / Paste | {key:Copy} / {key:Paste}: independent copies on the active track at the edit cursor; Ctrl+X deletes the selected clips |
+| Copy / Paste | {key:Copy} / {key:Paste}: independent copies on the active track at the edit cursor, including from another PlumSpirit window on Windows. {key:Cut} copies before deleting |
 | Paste Repeat | {key:PasteRepeat}: the selected clips again a number of times, end to end or evenly spaced |
 | Merge | {cmd:MergeClips(Sequence)} or {cmd:MergeClips(Stack)} — a Preview first |
 | Delete | {key:Delete} |

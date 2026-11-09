@@ -122,6 +122,42 @@ fn every_parameter_kind_reaches_the_script_exactly_as_declared() {
     // A run that changes nothing commits nothing.
     assert!(host.take_commits().is_none());
 }
+#[test]
+fn optional_multiline_text_is_strict_and_preserves_legacy_defaults_and_literal_bytes() {
+    let entry = r#"function register(p)p.tool{id='text',name='Text',needs_selection=false,params={
+      {key='old',kind='text',max_len=100,default='legacy'},
+      {key='lines',kind='text',multiline=true,max_len=100,default='é\r\nTwo👨‍👩‍👧‍👦'}},
+      run=function(ctx)assert(ctx.params.old=='legacy');assert(ctx.owner_track==ctx.track);return ctx.params.lines end}end"#;
+    let host = plugin_host(&[Capability::ReadProject, Capability::EditNotes], entry).unwrap();
+    let decl = host.take_decls().unwrap().tools.remove(0);
+    assert_eq!(
+        decl.params[0].kind,
+        ToolParamKind::Text {
+            max_len: 100,
+            multiline: false
+        }
+    );
+    assert_eq!(
+        decl.params[1].kind,
+        ToolParamKind::Text {
+            max_len: 100,
+            multiline: true
+        }
+    );
+    let (doc, mut history) = project(0, false);
+    host.set_world(Some(world(&doc, &mut history)));
+    let values = decl.defaults();
+    let literal = params_literal(&decl, &values);
+    let result=host.run("multiline-values.lua",&format!("return plum.plugin.__run_tool('text',{literal},{{track={},preview=true,keys=128}})",doc.track(0).unwrap().id().0)).unwrap();
+    assert_eq!(result, Plain::String("e\u{301}\r\nTwo👨‍👩‍👧‍👦".into()));
+    assert!(host.take_commits().is_none());
+    for value in ["1", "'true'", "{}"] {
+        let invalid = entry.replace("multiline=true", &format!("multiline={value}"));
+        assert!(plugin_host(&[], &invalid).is_err());
+    }
+    let invalid = entry.replace("default='é\\r\\nTwo👨‍👩‍👧‍👦'", "default=string.char(255)");
+    assert!(plugin_host(&[], &invalid).is_err());
+}
 
 #[test]
 fn declarations_are_checked_and_only_while_loading() {
@@ -257,6 +293,7 @@ fn a_tool_previews_applies_as_one_undo_step_and_cancel_changes_nothing() {
     assert_eq!((decl.id.as_str(), decl.name.as_str()), ("up", "Raise"));
     let track = doc.track(0).unwrap().id().0;
     let job = |preview: bool, generation: u64, w: World| ToolJob {
+        stroke: None,
         tool: "up".into(),
         params: params_literal(&decl, &decl.defaults()),
         track,
@@ -388,4 +425,98 @@ fn refreshing_an_edited_plugin_keeps_the_old_version_when_the_new_one_fails() {
             .any(|l| l.text.contains("Reloaded after its files changed"))
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn custom_linked_content_writer_uses_editing_tracks_default_channel_and_subchannel_table() {
+    use plumspirit_engine::editor::clips::{add_clip, duplicate_clips};
+    use plumspirit_engine::history::Operation;
+    use plumspirit_engine::model::{ContentRef, Subchannel, SubchannelId};
+    for extended in [false, true] {
+        let (mut d, mut history) = project(0, extended);
+        let d = Arc::make_mut(&mut d);
+        d.add_track().unwrap();
+        let second = d.track(1).unwrap().id();
+        let first_track = d.track(0).unwrap().id();
+        let mut props = d.track(1).unwrap().props().clone();
+        props.default_channel = 9;
+        history
+            .apply(
+                d,
+                Operation::TrackProps {
+                    track: second,
+                    props,
+                    end: None,
+                    label: "Fixture channel",
+                },
+            )
+            .unwrap();
+        history
+            .apply(
+                d,
+                Operation::AddSubchannels {
+                    track: 1,
+                    subs: vec![Subchannel::new(SubchannelId(7), 9)],
+                },
+            )
+            .unwrap();
+        let op = add_clip(d, 0, 100, 960).unwrap();
+        history.apply(d, op).unwrap();
+        let c = d.clips().contents()[0].id;
+        let first = d.clips().placements_of(ContentRef::Owned(c))[0].id;
+        let op = duplicate_clips(d, &[(first, 1, 2000)], true).unwrap();
+        history.apply(d, op).unwrap();
+        let mut doc = Arc::new(d.clone());
+        let before = doc.export_fingerprint();
+        let source = r#"function register(p)
+          p.tool{id='owner',name='Owner writer',needs_selection=false,run=function(ctx)
+            assert(ctx.owner_track==plum.project.current():track(2))
+            assert(ctx.owner_track~=ctx.track and ctx.track:kind()=='clip_content')
+            assert(ctx.owner_track:subchannels()[2]:id()==7)
+            local c=ctx.owner_track:subchannels()[2]:note_color()
+            assert(math.type(c.r)=='integer'and c.r>=0 and c.r<=255)
+            local w=ctx.tx:note_writer(ctx.track)
+            w:append{start={17},gate={20},key={60},subchannel={7}}
+            w:finish()
+            local b=ctx.track:notes():batches{columns={'track_id','content_id'}}()
+            assert(b.track_id[1]==plum.project.current():track(2):id())
+            assert(b.content_id[1]==ctx.track:id())
+          end}
+        end"#;
+        let host = plugin_host(&[Capability::ReadProject, Capability::EditNotes], source).unwrap();
+        host.set_world(Some(world(&doc, &mut history)));
+        let script = format!(
+            "return plum.plugin.__run_tool('owner',{{}},{{track={},content={},keys={}}})",
+            second.0,
+            c.0,
+            if extended { 256 } else { 128 }
+        );
+        host.run("owner.lua", &script)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(doc.export_fingerprint(), before);
+        let mut commit = host.take_commits().unwrap();
+        let staged = commit.result().clips().content(c).unwrap();
+        assert_eq!(staged.notes.len(), 1);
+        let n = staged.notes.iter().next().unwrap();
+        assert_eq!(n.attrs.channel(), 9);
+        assert_eq!(n.sub, SubchannelId(7));
+        commit.apply(&mut history, &mut doc).unwrap();
+        let after = doc.export_fingerprint();
+        assert_ne!(before, after);
+        history.undo(Arc::make_mut(&mut doc)).unwrap().unwrap();
+        assert_eq!(doc.export_fingerprint(), before);
+        history.redo(Arc::make_mut(&mut doc)).unwrap().unwrap();
+        assert_eq!(doc.export_fingerprint(), after);
+        assert_eq!(doc.track_by_id(first_track).unwrap().notes.len(), 0);
+        host.set_world(Some(world(&doc, &mut history)));
+        let wrong = script.replace(
+            &format!("track={}", second.0),
+            &format!("track={}", first_track.0),
+        );
+        assert!(
+            host.run("wrong-owner.lua", &wrong).is_err(),
+            "first track must not borrow second-only subchannel"
+        );
+        assert!(host.take_commits().is_none());
+    }
 }

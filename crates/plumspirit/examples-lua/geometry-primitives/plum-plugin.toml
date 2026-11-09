@@ -1,0 +1,9 @@
+id = "plumspirit.example.geometry-primitives"
+name = "Geometry Primitives"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Explicit author-written path sampling and MIDI mapping through shared native geometry."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "notes.edit"]

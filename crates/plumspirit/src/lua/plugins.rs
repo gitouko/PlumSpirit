@@ -12,6 +12,9 @@
 //! loading or in a lifecycle hook reaches the project (only commands' and
 //! tools' transactions, which the app applies through the undo history).
 
+#[path = "service_broker.rs"]
+mod service_broker;
+
 use super::package::{InstallReport, Manifest, Origin, Store};
 use super::plugin_api::{Decls, PluginMeta};
 use super::selection::UiSelection;
@@ -20,6 +23,7 @@ use super::worker::{ScriptJob, ScriptResult, ScriptWorker};
 use super::{Capability, Limits, ScriptError, Scripts, World};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What the user decided about one installed plugin (`settings.json`).
@@ -137,15 +141,17 @@ pub struct LogLine {
 
 /// Lines kept per plugin.
 pub const LOG_LINES: usize = 1000;
+pub const LOG_BYTES: usize = 1024 * 1024;
 
 /// A plugin's diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct PluginLog {
     lines: VecDeque<LogLine>,
+    bytes: usize,
 }
 
 impl PluginLog {
-    pub fn push(&mut self, level: Level, text: impl Into<String>) {
+    pub fn push(&mut self, level: Level, text: impl AsRef<str>) {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -155,14 +161,25 @@ impl PluginLog {
             (secs / 60) % 60,
             secs % 60
         );
-        for l in text.into().lines() {
-            if self.lines.len() == LOG_LINES {
-                self.lines.pop_front();
+        let text = super::diagnostic_text(text.as_ref(), 64 * 1024);
+        // Both scanning work and retained bytes are bounded. Preserve ordinary
+        // multiline log semantics (the last1000lines in chronological order).
+        let mut lines: Vec<_> = text.lines().rev().take(LOG_LINES).collect();
+        lines.reverse();
+        for line in lines {
+            let line = super::diagnostic_text(line, super::MAX_DIAGNOSTIC_LINE_BYTES);
+            while self.lines.len() >= LOG_LINES || self.bytes + line.len() > LOG_BYTES {
+                if let Some(old) = self.lines.pop_front() {
+                    self.bytes -= old.text.len();
+                } else {
+                    break;
+                }
             }
+            self.bytes += line.len();
             self.lines.push_back(LogLine {
                 at: at.clone(),
                 level,
-                text: l.to_owned(),
+                text: line.into_owned(),
             });
         }
     }
@@ -181,6 +198,7 @@ impl PluginLog {
 
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.bytes = 0;
     }
 
     /// The log as text for a bug report, redacted ([`redact`]).
@@ -283,6 +301,8 @@ pub(crate) fn replace_ci(s: &str, pat: &str, with: &str) -> String {
 /// literal, what it edits and whether it is a preview.
 #[derive(Clone)]
 pub struct ToolJob {
+    /// Typed native captured input; never encoded in Lua source.
+    pub stroke: Option<std::sync::Arc<super::drawing::Captured>>,
     pub tool: String,
     /// `{ key = value, … }` ([`super::custom::params_literal`]).
     pub params: String,
@@ -305,6 +325,17 @@ enum Pending {
     /// ([`PluginEvent::NeedWorld`]).
     ProjectOpen(Option<World>),
     ProjectClose,
+    Observe(super::reactive::Delivery),
+    Service {
+        call_id: u64,
+        job: super::services::Job,
+        request: Option<super::service_calls::Request>,
+    },
+    Response {
+        delivery: super::reactive::Delivery,
+        request: super::response::Request,
+        world: Option<World>,
+    },
     Command {
         id: String,
         /// The options dialog's values as a Lua table literal (`nil`: none).
@@ -312,6 +343,10 @@ enum Pending {
         world: Option<World>,
     },
     Tool(ToolJob),
+    Format {
+        request: super::formats::Request,
+        world: Option<World>,
+    },
     Unload,
 }
 
@@ -322,14 +357,31 @@ impl Pending {
             Pending::Load => "on_load / register".into(),
             Pending::ProjectOpen(_) => "on_project_open".into(),
             Pending::ProjectClose => "on_project_close".into(),
+            Pending::Observe(d) => format!("the observer {} ({})", d.id, d.event.kind.name()),
+            Pending::Service { job, .. } => format!("the service {}", job.id),
+            Pending::Response { request, .. } => {
+                format!("the automatic response {}", request.command)
+            }
             Pending::Command { id, .. } => format!("the command {id}"),
             Pending::Tool(t) => format!("the tool {}", t.tool),
+            Pending::Format { request, .. } => {
+                format!("{} format {}", request.mode.name(), request.id)
+            }
             Pending::Unload => "on_unload".into(),
         }
     }
 
+    fn delivery(&self) -> Option<&super::reactive::Delivery> {
+        match self {
+            Self::Observe(d) | Self::Response { delivery: d, .. } => Some(d),
+            _ => None,
+        }
+    }
     fn is_user_job(&self) -> bool {
-        matches!(self, Pending::Command { .. } | Pending::Tool(_))
+        matches!(
+            self,
+            Pending::Command { .. } | Pending::Tool(_) | Pending::Format { .. }
+        )
     }
 }
 
@@ -358,15 +410,44 @@ struct Runner {
     /// `on_load` / `register` finished.
     ready: bool,
     unload_started: Option<Instant>,
+    observations: super::reactive::Inbox,
+    observation_failed: bool,
+    lifetime: std::sync::Arc<super::reactive::Fence>,
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.lifetime.invalidate();
+    }
 }
 
 impl Runner {
     fn busy(&self) -> bool {
-        self.running.is_some() || !self.queue.is_empty()
+        self.running.is_some() || !self.queue.is_empty() || self.observations.len() > 0
+    }
+
+    fn preempt_automatic(&mut self) {
+        for d in self.queue.iter().filter_map(Pending::delivery) {
+            d.fence.invalidate();
+        }
+        self.queue.retain(|j| j.delivery().is_none());
+        if let Some(d) = self.running.as_ref().and_then(Pending::delivery) {
+            d.fence.invalidate();
+            self.observations.invalidate_running();
+            self.worker.cancel_job();
+        }
     }
 
     /// Queues `on_unload()` (cancelling what runs) for a ready state.
     fn retire(mut self) -> Option<Runner> {
+        self.lifetime.invalidate();
+        self.observations.clear();
+        if let Some(d) = self.running.as_ref().and_then(Pending::delivery) {
+            d.fence.invalidate();
+        }
+        for d in self.queue.iter().filter_map(Pending::delivery) {
+            d.fence.invalidate();
+        }
         self.queue.clear();
         if self.worker.is_busy() {
             self.worker.cancel();
@@ -421,6 +502,14 @@ impl Plugin {
         })
     }
 
+    /// Native UI actions keep the exact loaded instance, not just its plugin id.
+    pub(crate) fn lifecycle(&self) -> Option<Arc<super::reactive::Fence>> {
+        self.runner
+            .as_ref()
+            .filter(|r| r.ready)
+            .map(|r| Arc::clone(&r.lifetime))
+    }
+
     /// The capabilities in force: asked for by the manifest and granted.
     pub fn effective(&self, state: Option<&PluginState>) -> Vec<Capability> {
         let (Ok(m), Some(s)) = (&self.manifest, state) else {
@@ -439,6 +528,18 @@ impl Plugin {
     /// own window.
     pub fn running_command(&self) -> Option<(String, Duration)> {
         let r = self.runner.as_ref()?;
+        if let Some(Pending::Format { request, .. }) = &r.running {
+            let name = self
+                .decls
+                .formats
+                .iter()
+                .find(|d| d.id == request.id)
+                .map_or_else(|| request.id.clone(), |d| d.name.clone());
+            return Some((
+                format!("{} — {}", request.mode.name(), name),
+                r.started.map_or_else(Default::default, |t| t.elapsed()),
+            ));
+        }
         let Some(Pending::Command { id, .. }) = &r.running else {
             return None;
         };
@@ -464,12 +565,32 @@ impl Plugin {
 
 /// What the app must do after [`PluginManager::poll`].
 pub enum PluginEvent {
+    TransportLoop {
+        plugin: String,
+        intent: super::playback::loop_intent::Intent,
+        lifecycle: std::sync::Arc<super::reactive::Fence>,
+    },
+    TransportMidi {
+        plugin: String,
+        intent: super::playback::midi::Intent,
+        lifecycle: std::sync::Arc<super::reactive::Fence>,
+    },
+    DiscardMidi(super::playback::midi::Intent),
     /// A command finished with transactions: apply them through the undo
     /// history (ask first when `needs_confirmation`).
     Commits {
         plugin: String,
         command: String,
         commits: Commits,
+    },
+    /// Musical imports are held for explicit native review, never auto-applied.
+    FormatResult {
+        plugin: String,
+        format: String,
+        mode: super::formats::Mode,
+        selected: bool,
+        result: Result<Option<Commits>, String>,
+        lifecycle: Arc<super::reactive::Fence>,
     },
     /// A custom tool run finished: its transactions (Preview = Apply: a
     /// preview's commits are what Apply applies), or why it failed.
@@ -480,13 +601,40 @@ pub enum PluginEvent {
         preview: bool,
         result: Result<Option<Commits>, String>,
     },
+    ResponseRequest {
+        plugin: String,
+        delivery: super::reactive::Delivery,
+        request: super::response::Request,
+    },
+    ResponseResult {
+        plugin: String,
+        delivery: super::reactive::Delivery,
+        commits: Option<Commits>,
+        notices: Vec<(String, bool)>,
+        guard: Box<super::response::SnapshotGuard>,
+    },
     /// A command asked the UI to select these.
-    Select { plugin: String, ui: UiSelection },
+    Select {
+        plugin: String,
+        ui: UiSelection,
+    },
     /// A short message for the status bar (`error`: shown as an error).
-    Notice { text: String, error: bool },
+    Notice {
+        text: String,
+        error: bool,
+    },
+    /// Checked again by the app after any earlier commits in the same poll.
+    ObservationNotice {
+        delivery: super::reactive::Delivery,
+        text: String,
+        error: bool,
+    },
     /// B1-0035: a plugin's project settings changed: store `text` (empty:
     /// remove) in the open project, outside the undo history.
-    ProjectData { plugin: String, text: String },
+    ProjectData {
+        plugin: String,
+        text: String,
+    },
     /// Registrations changed (menus are rebuilt).
     DeclsChanged,
     /// A plugin waits to run `on_project_open`: call
@@ -508,6 +656,12 @@ pub struct PluginManager {
     asked_world: bool,
     /// `<settings>\plugin-data` (each plugin's settings and presets).
     data_root: Option<PathBuf>,
+    observation_stamp: Option<super::bridge::ProjectStamp>,
+    observation_sequence: u64,
+    observation_views: [Option<super::visual::Snapshot>; 2],
+    observation_playback: Option<super::playback::Snapshot>,
+    automation_barrier: Option<super::bridge::ProjectStamp>,
+    service_graph: super::service_calls::Graph,
 }
 
 impl PluginManager {
@@ -527,6 +681,12 @@ impl PluginManager {
             events: Vec::new(),
             project_open: false,
             asked_world: false,
+            observation_stamp: None,
+            observation_sequence: 0,
+            observation_views: [None, None],
+            observation_playback: None,
+            automation_barrier: None,
+            service_graph: Default::default(),
         };
         m.rescan();
         m
@@ -749,6 +909,9 @@ impl PluginManager {
             decls: Decls::default(),
             ready: false,
             unload_started: None,
+            observations: super::reactive::Inbox::default(),
+            observation_failed: false,
+            lifetime: super::reactive::Fence::live(),
         })
     }
 
@@ -1082,9 +1245,46 @@ impl PluginManager {
             ));
         }
         if let Some(r) = p.runner.as_mut() {
+            r.preempt_automatic();
             r.queue.push_back(Pending::Command {
                 id: command.to_owned(),
                 params,
+                world,
+            });
+        }
+        self.pump();
+        Ok(())
+    }
+
+    /// An explicit native format action. Imported commits must be reviewed before Apply.
+    pub fn run_format(
+        &mut self,
+        plugin: &str,
+        id: &str,
+        mode: super::formats::Mode,
+        world: Option<World>,
+    ) -> Result<(), String> {
+        let p = self.ready_runner(plugin)?;
+        if !p
+            .decls
+            .formats
+            .iter()
+            .any(|d| d.id == id && d.supports(mode))
+        {
+            return Err("The plugin has no such format operation.".into());
+        }
+        if p.user_job_pending() {
+            return Err(
+                "The plugin is still processing a user action; finish or cancel it first.".into(),
+            );
+        }
+        if let Some(r) = p.runner.as_mut() {
+            r.preempt_automatic();
+            r.queue.push_back(Pending::Format {
+                request: super::formats::Request {
+                    id: id.to_owned(),
+                    mode,
+                },
                 world,
             });
         }
@@ -1107,14 +1307,17 @@ impl PluginManager {
         let Some(r) = p.runner.as_mut() else {
             return Err("The plugin stopped.".into());
         };
-        if r.queue.iter().any(|j| matches!(j, Pending::Command { .. }))
+        if r.queue
+            .iter()
+            .any(|j| matches!(j, Pending::Command { .. } | Pending::Format { .. }))
             || r.running
                 .as_ref()
-                .is_some_and(|j| matches!(j, Pending::Command { .. }))
+                .is_some_and(|j| matches!(j, Pending::Command { .. } | Pending::Format { .. }))
         {
             return Err(format!("{} is running a command; wait for it.", p.name()));
         }
         r.queue.retain(|j| !matches!(j, Pending::Tool(_)));
+        r.preempt_automatic();
         r.queue.push_back(Pending::Tool(job));
         self.pump();
         Ok(())
@@ -1126,9 +1329,11 @@ impl PluginManager {
         if let Some(p) = self.plugin_mut(id)
             && let Some(r) = p.runner.as_mut()
         {
-            r.queue.retain(|j| !j.is_user_job());
+            r.queue
+                .retain(|j| !j.is_user_job() && j.delivery().is_none());
+            r.worker.cancel_midi_output();
             if r.running.as_ref().is_some_and(Pending::is_user_job) {
-                r.worker.cancel();
+                r.worker.cancel_job();
             }
         }
     }
@@ -1136,11 +1341,40 @@ impl PluginManager {
     /// A project was opened (or the open one replaced).
     pub fn project_opened(&mut self, world: World) {
         self.project_open = true;
+        self.observation_stamp = Some(super::bridge::ProjectStamp {
+            serial: world.project_serial(),
+            revision: world.info.revision,
+        });
         for p in &mut self.plugins {
             if let Some(r) = p.runner.as_mut() {
+                r.observations.clear();
+                if let Some(d) = r.running.as_ref().and_then(Pending::delivery) {
+                    d.fence.invalidate();
+                }
+                for d in r.queue.iter().filter_map(Pending::delivery) {
+                    d.fence.invalidate();
+                }
+                if r.running
+                    .as_ref()
+                    .is_some_and(|j| j.is_user_job() || j.delivery().is_some())
+                {
+                    r.worker.cancel();
+                }
+                r.queue
+                    .retain(|j| !j.is_user_job() && j.delivery().is_none());
                 r.queue.push_back(Pending::ProjectOpen(Some(world.clone())));
             }
         }
+        let stamp = self.observation_stamp.expect("opened project stamp");
+        self.publish_observation(
+            super::reactive::Kind::ProjectOpened,
+            stamp,
+            super::reactive::Data::Project {
+                tracks: world.doc.track_count() as u32,
+                notes: world.doc.stored_note_count() as u64,
+                keys: world.doc.project().keys.keys() as u16,
+            },
+        );
         self.pump();
     }
 
@@ -1162,16 +1396,313 @@ impl PluginManager {
 
     /// The open project is closing.
     pub fn project_closed(&mut self) {
+        self.observation_views = [None, None];
+        self.observation_playback = None;
         self.project_open = false;
+        let closed = self.observation_stamp.take();
         for p in &mut self.plugins {
             if let Some(r) = p.runner.as_mut() {
-                r.queue.retain(|j| !matches!(j, Pending::ProjectOpen(_)));
+                r.worker.release_ui_images();
+                r.observations.clear();
+                if let Some(d) = r.running.as_ref().and_then(Pending::delivery) {
+                    d.fence.invalidate();
+                }
+                for d in r.queue.iter().filter_map(Pending::delivery) {
+                    d.fence.invalidate();
+                }
+                if r.running
+                    .as_ref()
+                    .is_some_and(|j| j.is_user_job() || j.delivery().is_some())
+                {
+                    r.worker.cancel();
+                }
+                r.queue.retain(|j| {
+                    !j.is_user_job()
+                        && j.delivery().is_none()
+                        && !matches!(j, Pending::ProjectOpen(_))
+                });
                 if r.ready {
                     r.queue.push_back(Pending::ProjectClose);
                 }
             }
         }
+        if let Some(stamp) = closed {
+            self.publish_observation(
+                super::reactive::Kind::ProjectClosed,
+                stamp,
+                super::reactive::Data::Closed,
+            );
+        }
         self.pump();
+    }
+
+    /// Whether native change sampling is needed. Disabled/no-observer paths do
+    /// not inspect notes, allocate snapshots or dispatch worker jobs.
+    pub fn observing(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            p.status == Status::Ready
+                && p.runner.as_ref().is_some_and(|r| {
+                    r.decls.observers.iter().any(|d| {
+                        d.kinds.iter().any(|k| {
+                            !matches!(
+                                k,
+                                super::reactive::Kind::TransportChanged
+                                    | super::reactive::Kind::SurfaceChanged
+                            )
+                        })
+                    })
+                })
+        })
+    }
+
+    pub fn observing_playback(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            p.status == Status::Ready
+                && p.runner.as_ref().is_some_and(|r| {
+                    !r.observation_failed
+                        && r.decls
+                            .observers
+                            .iter()
+                            .any(|d| d.kinds.contains(&super::reactive::Kind::TransportChanged))
+                })
+        })
+    }
+    pub fn observing_surfaces(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            p.status == Status::Ready
+                && p.runner.as_ref().is_some_and(|r| {
+                    !r.observation_failed
+                        && r.decls
+                            .observers
+                            .iter()
+                            .any(|d| d.kinds.contains(&super::reactive::Kind::SurfaceChanged))
+                })
+        })
+    }
+    pub fn observing_overlay_playback(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            p.status == Status::Ready
+                && p.runner.as_ref().is_some_and(|r| {
+                    !r.observation_failed
+                        && r.worker.overlay_reads()[1]
+                        && !r.decls.observers.is_empty()
+                })
+        })
+    }
+    /// Copied native geometry only; never stores a document root.
+    pub fn set_observation_views(&mut self, views: [Option<super::visual::Snapshot>; 2]) {
+        if self.observation_views == views {
+            return;
+        }
+        self.observation_views = views;
+        for p in &mut self.plugins {
+            if let Some(r) = p.runner.as_mut()
+                && let Some(d) = r.running.as_ref().and_then(Pending::delivery)
+                && d.views.iter().any(Option::is_some)
+            {
+                d.fence.invalidate();
+                r.observations.invalidate_running();
+                r.worker.cancel_job();
+            }
+        }
+    }
+    pub fn set_observation_playback(&mut self, snapshot: Option<super::playback::Snapshot>) {
+        self.observation_playback = snapshot.filter(|s| s.valid());
+    }
+
+    /// Cheap every-frame revision fence; no snapshot is acquired.
+    pub fn observation_context(&mut self, stamp: Option<super::bridge::ProjectStamp>) {
+        if stamp == self.observation_stamp {
+            return;
+        }
+        self.observation_stamp = stamp;
+        for p in &mut self.plugins {
+            if let Some(r) = p.runner.as_mut()
+                && let Some(delivery) = r.running.as_ref().and_then(Pending::delivery)
+                && (Some(delivery.event.stamp) != stamp
+                    || delivery.event.kind == super::reactive::Kind::ProjectClosed)
+            {
+                delivery.fence.invalidate();
+                r.observations.invalidate_running();
+                r.worker.cancel();
+            }
+        }
+    }
+
+    /// Trusted native owner notification. This is a coalesced state signal, not
+    /// an edit log. Queues contain no document snapshots or per-note payloads.
+    pub fn publish_observation(
+        &mut self,
+        kind: super::reactive::Kind,
+        stamp: super::bridge::ProjectStamp,
+        data: super::reactive::Data,
+    ) -> bool {
+        use super::reactive::{Event, Kind};
+        if kind != Kind::ProjectClosed {
+            if !self.project_open
+                || self
+                    .observation_stamp
+                    .is_none_or(|s| s.serial != stamp.serial)
+            {
+                return false;
+            }
+        } else if self.project_open {
+            return false;
+        }
+        let Some(sequence) = self
+            .observation_sequence
+            .checked_add(1)
+            .filter(|s| *s <= i64::MAX as u64)
+        else {
+            return false;
+        };
+        let Some(mut event) = Event::new(kind, stamp, sequence, data) else {
+            return false;
+        };
+        event.transaction_allowed &= self.automation_barrier != Some(stamp);
+        if kind != Kind::ProjectClosed {
+            self.observation_stamp = Some(stamp);
+        }
+        self.observation_sequence = sequence;
+        let now = Instant::now();
+        for p in &mut self.plugins {
+            if p.status != Status::Ready {
+                continue;
+            }
+            let Some(r) = p.runner.as_mut() else {
+                continue;
+            };
+            if let super::reactive::Data::Surface { index, .. } = event.data
+                && !r.worker.overlay_reads()[usize::from(index)]
+            {
+                continue;
+            }
+            if r.decls.observers.is_empty() || r.observation_failed {
+                continue;
+            }
+            if let Some(d) = r.running.as_ref().and_then(Pending::delivery)
+                && (d.event.stamp != stamp
+                    || (d.event.kind == kind && kind != Kind::TransportChanged))
+            {
+                d.fence.invalidate();
+                r.observations.invalidate_running();
+                if matches!(kind, Kind::SurfaceChanged | Kind::ViewChanged) {
+                    r.worker.cancel_job();
+                } else {
+                    r.worker.cancel();
+                }
+            }
+            let budget = super::bridge::NativeBudget::for_plugin(&p.id);
+            if let Err(e) = r.observations.push(&r.decls, &event, now, &budget) {
+                r.observations.dropped = r.observations.dropped.saturating_add(1);
+                if r.observations.dropped.is_power_of_two() {
+                    p.log.push(
+                        Level::Warning,
+                        format!("Project observation queue refused native resources: {e:?}."),
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    pub fn set_automation_barrier(&mut self, stamp: Option<super::bridge::ProjectStamp>) {
+        self.automation_barrier = stamp;
+    }
+    pub fn response_log(&mut self, id: &str, text: impl Into<String>) {
+        if let Some(p) = self.plugin_mut(id) {
+            let text: String = text.into();
+            p.log.push(Level::Warning, text);
+        }
+    }
+    pub fn response_permitted(&self, id: &str, prefs: &PluginPrefs) -> bool {
+        let Some(p) = self.plugin(id) else {
+            return false;
+        };
+        let state = prefs.installed.get(id);
+        let caps = p.effective(state);
+        prefs.run_plugins
+            && state.is_some_and(|s| s.enabled)
+            && p.status == Status::Ready
+            && [
+                super::Capability::ReadProject,
+                super::Capability::ObserveProject,
+                super::Capability::AutomateProject,
+                super::Capability::EditNotes,
+            ]
+            .iter()
+            .all(|c| caps.contains(c))
+    }
+    pub fn queue_response(
+        &mut self,
+        id: &str,
+        mut delivery: super::reactive::Delivery,
+        request: super::response::Request,
+        world: World,
+        prefs: &PluginPrefs,
+    ) -> Result<(), String> {
+        if self.automation_barrier == Some(delivery.event.stamp)
+            || !delivery.valid()
+            || self.observation_stamp != Some(delivery.event.stamp)
+            || !self.project_open
+            || !delivery.event.transaction_allowed
+            || world.project_serial() != delivery.event.stamp.serial
+            || world.info.revision != delivery.event.stamp.revision
+        {
+            return Err("The automatic response source expired.".into());
+        }
+        let p = self
+            .plugin_mut(id)
+            .ok_or_else(|| "The response plugin is unavailable.".to_owned())?;
+        let state = prefs.installed.get(id);
+        let caps = p.effective(state);
+        if !prefs.run_plugins
+            || !state.is_some_and(|s| s.enabled)
+            || p.status != Status::Ready
+            || [
+                super::Capability::ReadProject,
+                super::Capability::ObserveProject,
+                super::Capability::AutomateProject,
+                super::Capability::EditNotes,
+            ]
+            .iter()
+            .any(|c| !caps.contains(c))
+        {
+            return Err(
+                "The plugin is not allowed to make automatic transaction responses.".into(),
+            );
+        }
+        let r = p
+            .runner
+            .as_mut()
+            .ok_or_else(|| "The response plugin stopped.".to_owned())?;
+        if r.observation_failed
+            || !r.decls.observers.iter().any(|d| d.id == delivery.id)
+            || !r.decls.commands.iter().any(|c| c.id == request.command)
+            || r.queue
+                .iter()
+                .any(|j| j.is_user_job() || matches!(j, Pending::Response { .. }))
+            || r.running
+                .as_ref()
+                .is_some_and(|j| j.is_user_job() || matches!(j, Pending::Response { .. }))
+        {
+            return Err(
+                "The response is unavailable while user work or another response is active.".into(),
+            );
+        }
+        if let Some(d) = r.running.as_ref().and_then(Pending::delivery) {
+            d.fence.invalidate();
+            r.observations.invalidate_running();
+            r.worker.cancel();
+        }
+        delivery.fence = super::reactive::Fence::live();
+        r.queue.push_front(Pending::Response {
+            delivery,
+            request,
+            world: Some(world),
+        });
+        self.pump();
+        Ok(())
     }
 
     /// Whether any plugin runs something (the app keeps polling while so).
@@ -1181,6 +1712,16 @@ impl PluginManager {
 
     /// Submits the next job of every idle state.
     fn pump(&mut self) {
+        let mut active_services = self
+            .plugins
+            .iter()
+            .filter(|p| {
+                p.runner
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.running, Some(Pending::Service { .. })))
+                    && !self.service_graph.waiting(&p.id)
+            })
+            .count();
         for p in &mut self.plugins {
             let entry = p
                 .manifest
@@ -1206,11 +1747,63 @@ impl PluginManager {
                 if matches!(r.queue.front(), Some(Pending::ProjectOpen(None))) {
                     continue; // waits for the app's world (`poll` asks)
                 }
-                let Some(job) = r.queue.pop_front() else {
-                    continue;
+                let mut job = match r.queue.pop_front() {
+                    Some(job) => job,
+                    None if which == 0 && r.ready && !r.worker.has_pending_overlay() => {
+                        match r.observations.take(Instant::now(), self.observation_stamp) {
+                            Some(mut delivery) => {
+                                if let super::reactive::Data::Surface {
+                                    index,
+                                    view_revision,
+                                } = delivery.event.data
+                                    && self.observation_views[usize::from(index)]
+                                        .map(|v| v.revision)
+                                        != view_revision
+                                {
+                                    continue;
+                                }
+                                let reads = r.worker.overlay_reads();
+                                delivery.views = std::array::from_fn(|i| {
+                                    self.observation_views[i]
+                                        .filter(|v| reads[i] && v.stamp == delivery.event.stamp)
+                                });
+                                delivery.playback = self
+                                    .observation_playback
+                                    .filter(|s| reads[1] && s.stamp == delivery.event.stamp);
+                                delivery.lifecycle = std::sync::Arc::clone(&r.lifetime);
+                                Pending::Observe(delivery)
+                            }
+                            None => continue,
+                        }
+                    }
+                    None => continue,
                 };
-                match submit(&mut r.worker, &job, &dir, &entry) {
+                if let Pending::Service {
+                    call_id, request, ..
+                } = &mut job
+                    && request
+                        .as_ref()
+                        .is_none_or(|q| !q.frame.matches(self.observation_stamp))
+                {
+                    self.service_graph.complete(*call_id);
+                    if let Some(request) = request.take() {
+                        request.respond(Err(super::service_calls::Failure::new(
+                            super::Category::Expired,
+                            "The queued service call expired.",
+                        )));
+                    }
+                    continue;
+                }
+                if matches!(job, Pending::Service { .. }) && active_services >= 4 {
+                    r.queue.push_front(job);
+                    continue;
+                }
+                let is_service = matches!(job, Pending::Service { .. });
+                match submit(&mut r.worker, &mut job, &dir, &entry) {
                     Ok(()) => {
+                        if is_service {
+                            active_services += 1;
+                        }
                         r.running = Some(job);
                         r.started = Some(Instant::now());
                     }
@@ -1235,7 +1828,9 @@ impl PluginManager {
     /// Collects finished jobs and starts the next ones; call it every frame
     /// while [`PluginManager::is_busy`] (never blocks). Returns what the app
     /// must apply or show.
-    pub fn poll(&mut self, _prefs: &PluginPrefs) -> Vec<PluginEvent> {
+    pub fn poll(&mut self, prefs: &PluginPrefs) -> Vec<PluginEvent> {
+        self.poll_service_calls(prefs);
+        let mut service_results = Vec::new();
         let mut events = std::mem::take(&mut self.events);
         let project_open = self.project_open;
         for p in &mut self.plugins {
@@ -1245,11 +1840,19 @@ impl PluginManager {
                 let r = &mut p.retiring[k];
                 let done = match r.worker.poll() {
                     Some(res) => {
-                        for line in &res.output {
-                            p.log.push(Level::Output, line.clone());
-                        }
-                        if let Err(e) = &res.result {
-                            p.log.push(Level::Warning, format!("on_unload: {e}"));
+                        let stale = r
+                            .running
+                            .as_ref()
+                            .and_then(Pending::delivery)
+                            .is_some_and(|d| !d.valid())
+                            || matches!(&r.running,Some(Pending::Service {job,..}) if !job.lifecycle.active());
+                        if !stale {
+                            for line in &res.output {
+                                p.log.push(Level::Output, line.clone());
+                            }
+                            if let Err(e) = &res.result {
+                                p.log.push(Level::Warning, format!("on_unload: {e}"));
+                            }
                         }
                         r.running = None;
                         r.queue.is_empty()
@@ -1295,6 +1898,7 @@ impl PluginManager {
                         }
                         let mut c = p.candidate.take().expect("candidate");
                         c.ready = true;
+                        c.worker.freeze_extensions();
                         if project_open {
                             c.queue.push_back(Pending::ProjectOpen(None));
                         }
@@ -1335,10 +1939,31 @@ impl PluginManager {
                 Some((job, res))
             });
             if let Some((job, res)) = res {
-                finish(p, job, res, &mut events);
+                if let Pending::Service {
+                    call_id,
+                    job: service,
+                    request: Some(request),
+                } = job
+                {
+                    service_results.push((p.id.clone(), call_id, service, request, res));
+                } else {
+                    finish(p, job, res, &mut events);
+                }
             }
         }
-        self.pump();
+        for (provider, id, job, request, result) in service_results {
+            self.complete_service(&provider, id, job, request, result, prefs);
+        }
+        self.poll_service_calls(prefs);
+        // Give staged native intents their owner turn before starting another run scope.
+        if !events.iter().any(|e| {
+            matches!(
+                e,
+                PluginEvent::TransportLoop { .. } | PluginEvent::TransportMidi { .. }
+            )
+        }) {
+            self.pump();
+        }
         let waiting = self.plugins.iter().any(|p| {
             p.runner.as_ref().is_some_and(|r| {
                 r.running.is_none() && matches!(r.queue.front(), Some(Pending::ProjectOpen(None)))
@@ -1350,10 +1975,82 @@ impl PluginManager {
         }
         events
     }
+
+    /// Only the active, user-invoked worker can produce UI effects. Loading
+    /// candidates and retiring states never acquire UI authority.
+    pub fn poll_panel_request(&self) -> Option<std::sync::Arc<super::ui::Shared>> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.runner.as_ref())
+            .find_map(|r| r.worker.poll_panel_request())
+    }
+    pub fn poll_overlay_request(&self) -> Option<(String, super::overlays::Batch)> {
+        self.plugins
+            .iter()
+            .filter(|p| p.status == Status::Ready)
+            .find_map(|p| {
+                p.runner
+                    .as_ref()?
+                    .worker
+                    .poll_overlay_request()
+                    .map(|b| (p.id.clone(), b))
+            })
+    }
+    pub fn poll_playback_request(&self) -> Option<super::playback::control::Request> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.runner.as_ref())
+            .find_map(|r| r.worker.poll_playback_request())
+    }
+    pub fn poll_ui_request(&self) -> Option<super::bridge::UiRequest> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.runner.as_ref())
+            .find_map(|runner| runner.worker.poll_ui_request())
+    }
+    pub fn poll_midi_input_request(&self) -> Option<super::midi_input::ConsentRequest> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.runner.as_ref())
+            .find_map(|runner| runner.worker.poll_midi_input_request())
+    }
 }
 
 /// Starts `job` on `worker`.
-fn submit(worker: &mut ScriptWorker, job: &Pending, dir: &Path, entry: &str) -> Result<(), String> {
+fn submit(
+    worker: &mut ScriptWorker,
+    job: &mut Pending,
+    dir: &Path,
+    entry: &str,
+) -> Result<(), String> {
+    if let Pending::Service { job, .. } = job {
+        return worker
+            .submit_service(job.clone())
+            .map_err(|e| e.to_string());
+    }
+    if let Pending::Response {
+        delivery,
+        request,
+        world,
+    } = job
+    {
+        let world = world
+            .take()
+            .ok_or_else(|| "The automatic response snapshot was already submitted.".to_owned())?;
+        return worker
+            .submit_response(world, delivery.clone(), request.clone())
+            .map_err(|e| e.to_string());
+    }
+    if let Pending::Format { request, world } = job {
+        return worker
+            .submit_format(request.clone(), world.take())
+            .map_err(|e| e.to_string());
+    }
+    if let Pending::Observe(delivery) = job {
+        return worker
+            .submit_observation(delivery.clone())
+            .map_err(|e| e.to_string());
+    }
     let (file, source, world) = match job {
         Pending::Entry => (
             entry.to_owned(),
@@ -1365,6 +2062,12 @@ fn submit(worker: &mut ScriptWorker, job: &Pending, dir: &Path, entry: &str) -> 
         Pending::ProjectOpen(w) => ("=on_project_open".into(), OPEN_SRC.into(), w.clone()),
         Pending::ProjectClose => ("=on_project_close".into(), CLOSE_SRC.into(), None),
         Pending::Unload => ("=on_unload".into(), UNLOAD_SRC.into(), None),
+        Pending::Observe(_)
+        | Pending::Response { .. }
+        | Pending::Service { .. }
+        | Pending::Format { .. } => {
+            unreachable!("typed native work handled above")
+        }
         // Ids are checked: a - z, 0 - 9, '.', '_', '-'.
         Pending::Command { id, params, world } => (
             format!("={id}"),
@@ -1391,17 +2094,40 @@ fn submit(worker: &mut ScriptWorker, job: &Pending, dir: &Path, entry: &str) -> 
     let time_limit =
         matches!(job, Pending::Command { .. } | Pending::Tool(_)).then_some(super::USER_RUN_TIME);
     worker
-        .submit(ScriptJob {
-            file,
-            source,
-            world,
-            time_limit,
-        })
+        .submit_with_stroke(
+            ScriptJob {
+                file,
+                source,
+                world,
+                time_limit,
+            },
+            matches!(job, Pending::Command { .. }) || matches!(job, Pending::Tool(t) if !t.preview),
+            match job {
+                Pending::Tool(t) => t.stroke.clone(),
+                _ => None,
+            },
+        )
         .map_err(|e| e.to_string())
 }
 
 /// Applies a finished job's result to plugin `p` (its running state).
 fn finish(p: &mut Plugin, job: Pending, res: ScriptResult, events: &mut Vec<PluginEvent>) {
+    if let Some(mut decls) = res.decls.clone()
+        && let Some(r) = p.runner.as_mut()
+        && r.ready
+    {
+        if r.observation_failed {
+            decls.observers.clear();
+        }
+        r.observations.sync(&decls);
+        r.decls = decls.clone();
+        p.decls = decls;
+    }
+    if let Some(delivery) = job.delivery()
+        && !delivery.valid()
+    {
+        return;
+    }
     let ScriptResult {
         result,
         commits,
@@ -1409,24 +2135,90 @@ fn finish(p: &mut Plugin, job: Pending, res: ScriptResult, events: &mut Vec<Plug
         output,
         decls,
         plugin,
+        response_guard,
+        service_reply: _,
     } = res;
+    if let Some(intent) = plugin.loop_intent {
+        if result.is_ok()
+            && matches!(job, Pending::Command { .. })
+            && commits.is_none()
+            && intent.valid()
+        {
+            if let Some(r) = p.runner.as_ref() {
+                events.push(PluginEvent::TransportLoop {
+                    plugin: p.id.clone(),
+                    intent,
+                    lifecycle: std::sync::Arc::clone(&r.lifetime),
+                });
+            }
+        } else {
+            p.log.push(Level::Warning,"The staged loop was discarded: use a successful standalone command without musical transactions.");
+        }
+    }
+    if let Some(intent) = plugin.midi_intent {
+        if result.is_ok()
+            && matches!(job, Pending::Command { .. })
+            && commits.is_none()
+            && intent.valid()
+        {
+            if let Some(r) = p.runner.as_ref() {
+                events.push(PluginEvent::TransportMidi {
+                    plugin: p.id.clone(),
+                    intent,
+                    lifecycle: std::sync::Arc::clone(&r.lifetime),
+                });
+            }
+        } else {
+            intent.refuse();
+            events.push(PluginEvent::DiscardMidi(intent));
+            p.log.push(Level::Warning,"The staged MIDI plan was discarded: use a successful standalone command without musical transactions.");
+        }
+    }
     for line in output {
         p.log.push(Level::Output, line);
     }
     for note in plugin.notes {
         p.log.push(Level::Warning, format!("settings: {note}"));
     }
-    if let Some(text) = plugin.project_data {
+    if job.delivery().is_none()
+        && !matches!(job, Pending::Format { .. })
+        && let Some(text) = plugin.project_data
+    {
         events.push(PluginEvent::ProjectData {
             plugin: p.id.clone(),
             text,
         });
     }
+    let mut response_notices = Vec::new();
     for (text, kind) in plugin.notices {
+        if matches!(job, Pending::Response { .. }) {
+            response_notices.push((
+                format!("{}: {text}", p.name()),
+                kind == super::plugin_api::NoticeKind::Error,
+            ));
+            continue;
+        }
         p.log.push(Level::Info, format!("notify: {text}"));
-        events.push(PluginEvent::Notice {
-            text: format!("{}: {text}", p.name()),
-            error: kind == super::plugin_api::NoticeKind::Error,
+        let text = format!("{}: {text}", p.name());
+        let error = kind == super::plugin_api::NoticeKind::Error;
+        events.push(if let Some(delivery) = job.delivery() {
+            PluginEvent::ObservationNotice {
+                delivery: delivery.clone(),
+                text,
+                error,
+            }
+        } else {
+            PluginEvent::Notice { text, error }
+        });
+    }
+    if result.is_ok()
+        && let Pending::Observe(delivery) = &job
+        && let Some(request) = plugin.response_request
+    {
+        events.push(PluginEvent::ResponseRequest {
+            plugin: p.id.clone(),
+            delivery: delivery.clone(),
+            request,
         });
     }
     let what = job.label();
@@ -1447,6 +2239,7 @@ fn finish(p: &mut Plugin, job: Pending, res: ScriptResult, events: &mut Vec<Plug
                     }
                     if load {
                         r.ready = true;
+                        r.worker.freeze_extensions();
                     }
                 }
                 if load {
@@ -1493,9 +2286,59 @@ fn finish(p: &mut Plugin, job: Pending, res: ScriptResult, events: &mut Vec<Plug
                 );
             }
         }
+        Pending::Service { .. } => unreachable!("service results are handled by the native broker"),
+        Pending::Response { delivery, .. } => match result {
+            Ok(_) => {
+                if let Some(guard) = response_guard {
+                    events.push(PluginEvent::ResponseResult {
+                        plugin: p.id.clone(),
+                        delivery,
+                        commits,
+                        guard: Box::new(guard),
+                        notices: response_notices,
+                    });
+                }
+            }
+            Err(e) => {
+                if let Some(r) = p.runner.as_mut() {
+                    r.observation_failed = true;
+                    r.observations.clear();
+                    r.decls.observers.clear();
+                    p.decls = r.decls.clone();
+                }
+                failed(p, &e, events);
+            }
+        },
+        Pending::Observe(_) => {
+            if let Err(e) = &result {
+                // Pause observation until reload. A handler cannot be retried
+                // forever or revive itself by publishing later declarations.
+                if let Some(r) = p.runner.as_mut() {
+                    r.observation_failed = true;
+                    r.observations.clear();
+                    r.decls.observers.clear();
+                    p.decls = r.decls.clone();
+                }
+                failed(p, e, events);
+            }
+        }
         Pending::Unload => {
             if let Err(e) = &result {
                 p.log.push(Level::Warning, format!("{what}: {e}"));
+            }
+        }
+        Pending::Format { request, .. } => {
+            let selected = matches!(result, Ok(super::Plain::Boolean(true)));
+            let result = result.map(|_| commits).map_err(|e| e.to_string());
+            if let Some(r) = p.runner.as_ref() {
+                events.push(PluginEvent::FormatResult {
+                    plugin: p.id.clone(),
+                    format: request.id,
+                    mode: request.mode,
+                    selected,
+                    result,
+                    lifecycle: Arc::clone(&r.lifetime),
+                });
             }
         }
         Pending::Command { id, .. } => match result {

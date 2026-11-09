@@ -207,22 +207,20 @@ impl PlumSpiritApp {
 
     /// The selected events of the active graph as an automation score.
     pub(super) fn save_automation_to(&mut self, path: PathBuf) {
-        let saved = self.event_clipboard.clone();
-        if !self.copy_graph_selection() {
+        let Some((_, clip)) = self.graph_selection_for_copy() else {
             self.set_status(
                 "Select points in the Event Graph (Control Change or Pitch Bend) first.",
                 StatusKind::Warning,
             );
             return;
-        }
-        let clip = std::mem::replace(&mut self.event_clipboard, saved);
+        };
         let channel = self.graph_slot(self.active_graph).channel;
         let ppq = self
             .doc()
             .and_then(|d| d.division().musical_ppqn())
             .unwrap_or(960) as u32;
         let lane = match clip {
-            Some(super::graphs::EventClipboard::Controller(c)) => match c.kind {
+            super::graphs::EventClipboard::Controller(c) => match c.kind {
                 Some(plumspirit_engine::editor::controllers::ControllerKind::Cc(n)) => {
                     Some(ScoreLane {
                         kind: LaneKind::Cc(n),

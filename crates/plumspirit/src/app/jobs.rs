@@ -99,6 +99,10 @@ pub enum JobKind {
     Edit {
         label: &'static str,
     },
+    Clipboard {
+        label: &'static str,
+        generation: u64,
+    },
     /// v0.8 §209: a transform tool computed on a worker (Repeat Last Tool,
     /// one-click commands, a window's Apply without a preview); the UI
     /// thread commits the result.
@@ -116,7 +120,7 @@ pub enum JobKind {
     },
 }
 
-pub enum JobOutput {
+pub(super) enum JobOutput {
     Import(Result<(PlumDocument, ImportSummary), MidiError>),
     /// L-D02: the MIDI files of an archive (spooled) with their quick info.
     Archive(
@@ -133,6 +137,7 @@ pub enum JobOutput {
     /// v1.0-beta1 (B1-0121): a strict no-edit export from the source file.
     ExportStrict(Result<midi::strict::StrictReport, ExportError>),
     Edit(Result<PreparedEdit, EditError>),
+    Clipboard(Result<super::musical_clipboard::Completion, String>),
     Tool(
         Result<
             plumspirit_engine::transform::TransformRun,
@@ -285,13 +290,17 @@ impl RunningJob {
         self.progress.load(Ordering::Relaxed)
     }
 
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
     /// Non-blocking poll. `Err(())` means the worker ended without a result
     /// (it panicked); the caller reports that as an error.
-    pub fn poll(&mut self) -> Result<Option<JobOutput>, ()> {
+    pub(super) fn poll(&mut self) -> Result<Option<JobOutput>, ()> {
         match self.rx.try_recv() {
             Ok(out) => {
                 if let Some(h) = self.handle.take() {
@@ -345,13 +354,14 @@ impl RunningJob {
             JobKind::Edit { label } | JobKind::Tool { label, .. } => {
                 format!("Applying {label}…")
             }
+            JobKind::Clipboard { label, .. } => format!("{label}…"),
             JobKind::Ppqn { apply: true, .. } => "Changing the PPQN…".into(),
             JobKind::Ppqn { .. } => "Computing the PPQN Preview…".into(),
         }
     }
 }
 
-fn spawn(
+pub(super) fn spawn(
     id: u64,
     kind: JobKind,
     total: u64,

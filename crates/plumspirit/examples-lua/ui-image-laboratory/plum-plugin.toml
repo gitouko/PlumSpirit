@@ -1,0 +1,6 @@
+id="plumspirit.example.ui-image-laboratory"
+name="UI Image Laboratory"
+version="0.2.0"
+api="0.2"
+entry="main.lua"
+capabilities=["ui.panels","file.read_user_choice"]

@@ -10,6 +10,8 @@
 //! use.
 
 use std::path::{Path, PathBuf};
+#[path = "fonts_bounded.rs"]
+pub(crate) mod bounded;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiFontKind {
@@ -120,11 +122,22 @@ fn parse_face(data: &[u8], dir: usize, index: u32) -> Option<FaceNames> {
 
 /// The names in a `name` table.
 fn parse_names(table: &[u8], index: u32) -> Option<FaceNames> {
+    parse_names_checked(table, index, usize::MAX, &mut |_| true)
+}
+fn parse_names_checked(
+    table: &[u8],
+    index: u32,
+    max_name: usize,
+    check: &mut impl FnMut(usize) -> bool,
+) -> Option<FaceNames> {
     let count = usize::from(be16(table, 2)?);
     let strings = usize::from(be16(table, 4)?);
     // Candidates per name id: (priority, text); lower priority value wins.
     let mut best: [Option<(u8, String)>; 4] = Default::default();
     for i in 0..count.min(4096) {
+        if i.is_multiple_of(64) && !check(0) {
+            return None;
+        }
         let r = 6 + i * 12;
         let platform = be16(table, r)?;
         let encoding = be16(table, r + 2)?;
@@ -142,6 +155,12 @@ fn parse_names(table: &[u8], index: u32) -> Option<FaceNames> {
         let Some(raw) = table.get(strings + offset..strings + offset + length) else {
             continue;
         };
+        if !check(raw.len()) {
+            return None;
+        }
+        if raw.len() > max_name {
+            continue;
+        }
         let (priority, text) = match platform {
             3 if encoding == 1 || encoding == 10 => {
                 (if language == 0x0409 { 0 } else { 1 }, decode_utf16be(raw))
@@ -153,7 +172,7 @@ fn parse_names(table: &[u8], index: u32) -> Option<FaceNames> {
             _ => continue,
         };
         let text = text.trim_matches('\0').trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() || text.len() > max_name {
             continue;
         }
         if best[slot].as_ref().is_none_or(|(p, _)| priority < *p) {
@@ -193,26 +212,43 @@ pub fn inspect_font(data: &[u8]) -> Vec<FaceNames> {
 
 /// The faces of a font file, reading only its table directories and `name`
 /// tables (a few KB, not the whole file).
-pub fn read_face_names(path: &Path) -> Vec<FaceNames> {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut read_at = |off: u64, len: usize| -> Option<Vec<u8>> {
+trait NameReader {
+    fn read_at(&mut self, off: u64, len: usize) -> Option<Vec<u8>>;
+    fn max_name(&self) -> usize {
+        usize::MAX
+    }
+    fn charge(&mut self, _bytes: usize) -> bool {
+        true
+    }
+    fn face_limit(&mut self, n: usize) -> usize {
+        n.min(256)
+    }
+}
+struct NativeNameReader(std::fs::File);
+impl NameReader for NativeNameReader {
+    fn read_at(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
         if len > 4 << 20 {
             return None;
         }
-        f.seek(SeekFrom::Start(off)).ok()?;
-        let mut b = vec![0u8; len];
-        f.read_exact(&mut b).ok()?;
-        Some(b)
-    };
-    let Some(head) = read_at(0, 12) else {
+        self.0.seek(SeekFrom::Start(off)).ok()?;
+        let mut bytes = vec![0u8; len];
+        self.0.read_exact(&mut bytes).ok()?;
+        Some(bytes)
+    }
+}
+pub fn read_face_names(path: &Path) -> Vec<FaceNames> {
+    std::fs::File::open(path)
+        .map(|f| read_faces_with(&mut NativeNameReader(f)))
+        .unwrap_or_default()
+}
+fn read_faces_with(reader: &mut impl NameReader) -> Vec<FaceNames> {
+    let Some(head) = reader.read_at(0, 12) else {
         return Vec::new();
     };
     let dirs: Vec<(u64, u32)> = if &head[0..4] == b"ttcf" {
-        let n = be32(&head, 8).unwrap_or(0).min(256) as usize;
-        let Some(offs) = read_at(12, n * 4) else {
+        let n = reader.face_limit(be32(&head, 8).unwrap_or(0) as usize);
+        let Some(offs) = reader.read_at(12, n * 4) else {
             return Vec::new();
         };
         (0..n)
@@ -225,21 +261,24 @@ pub fn read_face_names(path: &Path) -> Vec<FaceNames> {
     };
     let mut out = Vec::new();
     for (dir, index) in dirs {
-        let Some(h) = read_at(dir, 12) else { continue };
-        let n = usize::from(be16(&h, 4).unwrap_or(0)).min(512);
-        let Some(recs) = read_at(dir, 12 + n * 16) else {
-            continue;
-        };
-        let Some((off, len)) = name_table_at(&recs, 0) else {
-            continue;
-        };
-        if let Some(table) = read_at(off as u64, len)
-            && let Some(names) = parse_names(&table, index)
-        {
+        if !reader.charge(0) {
+            break;
+        }
+        if let Some(names) = read_face_with(reader, dir, index) {
             out.push(names);
         }
     }
     out
+}
+
+/// Shared single-face metadata read; callers own traversal and work limits.
+fn read_face_with(reader: &mut impl NameReader, dir: u64, index: u32) -> Option<FaceNames> {
+    let h = reader.read_at(dir, 12)?;
+    let n = usize::from(be16(&h, 4).unwrap_or(0)).min(512);
+    let recs = reader.read_at(dir, 12 + n * 16)?;
+    let (off, len) = name_table_at(&recs, 0)?;
+    let table = reader.read_at(off as u64, len)?;
+    parse_names_checked(&table, index, reader.max_name(), &mut |n| reader.charge(n))
 }
 
 /// One installed face.
@@ -329,30 +368,74 @@ fn is_font_file(p: &Path) -> bool {
     })
 }
 
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    files: usize,
+    path_bytes: usize,
+    no_links: bool,
+}
 fn scan_dir(dir: &Path, depth: u32, name_filter: &str, out: &mut Vec<PathBuf>, budget: &mut usize) {
+    let _ = scan_dir_checked(
+        dir,
+        depth,
+        name_filter,
+        out,
+        budget,
+        ScanLimits {
+            files: usize::MAX,
+            path_bytes: usize::MAX,
+            no_links: false,
+        },
+        &mut || true,
+    );
+}
+fn scan_dir_checked(
+    dir: &Path,
+    depth: u32,
+    name_filter: &str,
+    out: &mut Vec<PathBuf>,
+    budget: &mut usize,
+    limits: ScanLimits,
+    check: &mut impl FnMut() -> bool,
+) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for entry in rd.flatten() {
         if *budget == 0 {
-            return;
+            return false;
         }
         *budget -= 1;
+        if !check() {
+            return false;
+        }
         let p = entry.path();
+        if p.as_os_str().len() > limits.path_bytes {
+            return false;
+        }
         let Ok(ft) = entry.file_type() else {
             continue;
         };
+        if limits.no_links && ft.is_symlink() {
+            continue;
+        }
         if ft.is_dir() {
-            if depth > 0 {
-                scan_dir(&p, depth - 1, name_filter, out, budget);
+            if depth > 0
+                && !scan_dir_checked(&p, depth - 1, name_filter, out, budget, limits, check)
+            {
+                return false;
             }
         } else if is_font_file(&p) {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             if name.contains(name_filter) {
+                if out.len() == limits.files {
+                    return false;
+                }
                 out.push(p);
             }
         }
     }
+    true
 }
 
 fn system_font_dirs() -> Vec<PathBuf> {
@@ -522,6 +605,9 @@ pub fn install(ctx: &egui::Context, font: &UiFont) {
     }
     ctx.set_fonts(defs);
 }
+
+#[cfg(test)]
+pub(crate) use tests::fake_font;
 
 #[cfg(test)]
 mod tests {

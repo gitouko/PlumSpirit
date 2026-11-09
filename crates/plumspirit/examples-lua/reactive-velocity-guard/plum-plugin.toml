@@ -1,0 +1,9 @@
+id = "plumspirit.example.reactive-velocity"
+name = "Reactive Velocity Guard"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Author-written velocity ceiling on the first Track, via separately authorized event transaction requests."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["project.read", "project.observe", "project.automate", "notes.edit"]

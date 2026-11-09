@@ -1,0 +1,9 @@
+id = "plumspirit.example.file-transform"
+name = "Selected Text File"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+description = "Streams a user-selected UTF-8 text file, uppercases ASCII letters, and atomically saves a user-selected output."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["file.read_user_choice", "file.write_user_choice"]

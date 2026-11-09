@@ -97,6 +97,7 @@ pub struct Manifest {
     /// Settings saved with a lower number pass through the plugin's
     /// `migrate_config`.
     pub config_version: u64,
+    pub service_dependencies: Vec<super::service_calls::Dependency>,
 }
 
 impl Manifest {
@@ -127,6 +128,7 @@ impl Manifest {
             "license",
             "capabilities",
             "config_version",
+            "service_dependencies",
         ];
         if let Some((k, _)) = kv.iter().find(|(k, _)| !known.contains(&k.as_str())) {
             return Err(format!(
@@ -205,6 +207,35 @@ impl Manifest {
                 ));
             }
         };
+        let service_dependencies = match get("service_dependencies") {
+            None => Vec::new(),
+            Some(TomlValue::List(values)) if values.len() <= 32 => {
+                let mut seen = BTreeSet::new();
+                let mut deps = Vec::new();
+                for value in values {
+                    let dep = super::service_calls::Dependency::parse(value)
+                        .map_err(|e| format!("{MANIFEST}: service_dependencies: {e}"))?;
+                    if !seen.insert(dep.namespace.clone()) {
+                        return Err(format!(
+                            "{MANIFEST}: duplicate service dependency {}",
+                            dep.namespace
+                        ));
+                    }
+                    deps.push(dep);
+                }
+                deps
+            }
+            _ => {
+                return Err(format!(
+                    "{MANIFEST}: service_dependencies must be a list of at most32 provider.id/service@major.minor texts."
+                ));
+            }
+        };
+        if !service_dependencies.is_empty() && api < (0, 2) {
+            return Err(format!(
+                "{MANIFEST}: service dependencies require API0.2 or newer."
+            ));
+        }
         Ok(Manifest {
             id,
             name: name.trim().to_owned(),
@@ -216,6 +247,7 @@ impl Manifest {
             author,
             license,
             capabilities,
+            service_dependencies,
         })
     }
 
@@ -236,7 +268,7 @@ impl Manifest {
             o
         };
         let caps: Vec<String> = self.capabilities.iter().map(|c| q(c)).collect();
-        format!(
+        let mut text = format!(
             "id = {}\nname = {}\nversion = {}\napi = {}\nentry = {}\ndescription = {}\nauthor = {}\nlicense = {}\ncapabilities = [{}]\nconfig_version = {}\n",
             q(&self.id),
             q(&self.name),
@@ -248,7 +280,16 @@ impl Manifest {
             q(&self.license),
             caps.join(", "),
             self.config_version
-        )
+        );
+        if !self.service_dependencies.is_empty() {
+            let deps: Vec<_> = self
+                .service_dependencies
+                .iter()
+                .map(|d| q(&d.text()))
+                .collect();
+            text.push_str(&format!("service_dependencies = [{}]\n", deps.join(", ")));
+        }
+        text
     }
 
     /// Whether this PlumSpirit's API can run it: same major, equal or later
@@ -825,6 +866,7 @@ impl Store {
             license: String::new(),
             capabilities: caps,
             config_version: 1,
+            service_dependencies: Vec::new(),
         };
         let stage = self.staging(&manifest.id)?;
         let written = fs::write(stage.join(name), text.as_bytes())

@@ -10,6 +10,7 @@
 mod common;
 
 use common::kiva::kiva_load;
+use plumspirit_engine::codec::{Crc32, put_uvarint};
 use plumspirit_engine::editor::clips::duplicate_clips;
 use plumspirit_engine::history::{History, Operation};
 use plumspirit_engine::midi::{
@@ -596,9 +597,39 @@ fn the_owners_resaved_test_lup_plays_the_pinned_notes_and_exports_the_owners_tes
     let (a, _) = import_bytes(&write(false, true)).unwrap();
     let (b, _) = import_bytes(&read("kiva-variants/Test.program0.mid")).unwrap();
     assert_eq!(played(&a), played(&b));
-    // A save / reopen of the owner's file keeps its bytes.
+    // Saving updates the writer stamp in META and its checksum. Every other
+    // byte must match the owner's historical file, including same-tick order.
+    let mut expected = read("owner-2026-10-30/Test.lup");
+    let meta_header = 32..48;
+    let meta_start = meta_header.end;
+    assert_eq!(&expected[32..36], b"META");
+    assert_eq!(&expected[meta_start..meta_start + 5], b"\x04Test");
+    let old_stamp = b"\x10PlumSpirit 1.0.0";
+    let stamp_start = meta_start + 5;
+    let stamp_range = stamp_start..stamp_start + old_stamp.len();
+    assert_eq!(&expected[stamp_range.clone()], old_stamp);
+    let writer = format!("PlumSpirit {}", plumspirit_engine::VERSION);
+    let mut stamp = Vec::new();
+    put_uvarint(&mut stamp, writer.len() as u64);
+    stamp.extend_from_slice(writer.as_bytes());
+    let old_size = u64::from_le_bytes(expected[40..48].try_into().unwrap());
+    let size = old_size - old_stamp.len() as u64 + stamp.len() as u64;
+    expected.splice(stamp_range, stamp);
+    expected[40..48].copy_from_slice(&size.to_le_bytes());
+    let meta_end = meta_start + size as usize;
+    let payload_crc = Crc32::of(&expected[meta_start..meta_end]);
+    let mut checksum = Crc32::new();
+    checksum.update(&expected[meta_header]);
+    checksum.update(&payload_crc.to_le_bytes());
+    expected[meta_end..meta_end + 4].copy_from_slice(&checksum.finish().to_le_bytes());
+
+    let saved = project_to_bytes(&owner).unwrap();
+    assert_eq!(saved.len(), expected.len());
     assert_eq!(
-        project_to_bytes(&owner).unwrap(),
-        read("owner-2026-10-30/Test.lup")
+        saved.iter().zip(&expected).position(|(a, b)| a != b),
+        None,
+        "unexpected difference from the historical file with the new writer stamp"
     );
+    let (reopened, _) = project_from_bytes(&saved).unwrap();
+    assert_eq!(played(&reopened), played(&owner));
 }

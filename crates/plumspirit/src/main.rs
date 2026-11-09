@@ -1,4 +1,4 @@
-//! PlumSpirit — an original Black MIDI editor (PlumSpirit v1.0-Launch).
+//! PlumSpirit — an original Black MIDI editor (PlumSpirit v1.0.2).
 //!
 //! Startup is deliberately light: read settings, find the UI font, create the window.
 //! No filesystem scanning beyond the font folders, no network, no external
@@ -12,6 +12,8 @@ mod archive;
 mod assets;
 mod audio;
 mod diagnostics;
+mod font_shape;
+mod image_decode;
 mod inspector;
 mod lua;
 mod piano_roll;
@@ -33,11 +35,11 @@ use std::path::PathBuf;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// The short release label ("v1.0-Launch") shown on the start screen; derived
-/// from the workspace version by `release_metadata_agrees_with_the_workspace_version`.
+/// The short release label shown on the start screen and in the window title.
+/// `release_metadata_agrees_with_the_workspace_version` checks the label and PE resources.
 macro_rules! release_label {
     () => {
-        "v1.0-Launch"
+        "v1.0.2"
     };
 }
 pub const RELEASE_LABEL: &str = release_label!();
@@ -121,6 +123,9 @@ fn fit_window(saved: [f32; 2], work_area: Option<[f32; 4]>) -> ([f32; 2], Option
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = font_shape::entry() {
+        return code;
+    }
     let args = parse_args();
     let config_dir = settings::config_dir();
     let log_path = diagnostics::logging::init(config_dir.as_deref());
@@ -311,13 +316,17 @@ mod tests {
         let (maj, min, pat) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
         let (tag, build) = match pre.split_once('.') {
             Some((kind, n)) => (format!("-{kind}{n}"), n.to_owned()),
-            None if pre.is_empty() && (maj, min) == ("1", "0") => {
+            None if pre.is_empty() && (maj, min, pat) == ("1", "0", "0") => {
                 ("-Launch".to_owned(), "0".to_owned())
             }
             None if pre.is_empty() => (String::new(), "0".to_owned()),
             None => panic!("pre-release {pre:?} needs a number"),
         };
-        let short = format!("v{maj}.{min}{tag}");
+        let short = if pre.is_empty() && pat != "0" {
+            format!("v{core}")
+        } else {
+            format!("v{maj}.{min}{tag}")
+        };
         assert_eq!(RELEASE_LABEL, short);
         let label = format!("PlumSpirit {short}");
         assert_eq!(RELEASE_NAME, label);

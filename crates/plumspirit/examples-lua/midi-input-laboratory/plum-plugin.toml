@@ -1,0 +1,10 @@
+id = "plumspirit.example.midi-input-laboratory"
+name = "MIDI Input Laboratory"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+config_version = 1
+author = "PlumSpirit contributors"
+license = "MIT"
+description = "Author-written bounded MIDI capture, exact persisted replay and note/CC/Pitch Bend artwork with native Preview and Undo."
+capabilities = ["midi.input", "notes.edit", "project.read"]

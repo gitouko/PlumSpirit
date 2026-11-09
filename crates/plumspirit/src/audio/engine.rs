@@ -104,6 +104,11 @@ impl Audition {
 
 /// Commands from the UI thread to the synthesis worker.
 pub enum Command {
+    /// Worker-prepared isolated native voices; never a Lua callback or shared route.
+    PluginMidi {
+        voice: Box<super::midi_overlay::PreparedVoice>,
+        life: super::midi_overlay::Life,
+    },
     /// Replace the synthesizer's SoundFont at a block boundary.
     SetSoundFont(Arc<SoundFont>),
     /// Start (or restart) playback at `tick` with this index, looping `[start,
@@ -378,7 +383,7 @@ impl Shared {
 }
 
 /// Synthesizer adapter (the audition synthesizer, offline renders).
-struct Sink<'a>(&'a mut Synthesizer);
+pub(crate) struct Sink<'a>(pub(crate) &'a mut Synthesizer);
 
 /// The transport's synthesizers as one sink for the scheduler.
 pub(crate) struct BankSink<'a>(pub(crate) &'a mut SynthBank);
@@ -545,6 +550,7 @@ struct Worker {
     /// Sends external MIDI (started with the first external route).
     dispatcher: Option<Dispatcher>,
     audition: Option<Audition>,
+    plugin_midi: Option<super::midi_overlay::Voice>,
     /// Reference audio mixed into the transport's blocks.
     reference: Option<Arc<super::reference::RefPlay>>,
 }
@@ -693,7 +699,47 @@ impl Worker {
     }
 
     fn handle(&mut self, cmd: Command) -> bool {
+        if matches!(
+            &cmd,
+            Command::SetSoundFont(_)
+                | Command::SetRender(_)
+                | Command::Configure(_)
+                | Command::Play { .. }
+                | Command::SetLoop(_)
+                | Command::SetEligible(_)
+                | Command::SetRoutes(_)
+                | Command::Update { .. }
+                | Command::Pause
+                | Command::ReleaseProject { .. }
+                | Command::Shutdown
+        ) {
+            self.plugin_midi = None;
+        }
         match cmd {
+            Command::PluginMidi { voice, life } => {
+                if !life.active() {
+                    life.end(super::midi_overlay::Status::Canceled);
+                    return true;
+                }
+                let valid = self.playing
+                    && !self.render.prerender
+                    && self.plugin_midi.is_none()
+                    && voice.sample_rate() == self.sample_rate
+                    && self
+                        .sched
+                        .as_ref()
+                        .zip(self.font.as_ref())
+                        .is_some_and(|(s, f)| voice.matches(&s.index().tempo, f));
+                if valid {
+                    self.plugin_midi = voice.start(
+                        self.sched.as_ref().expect("checked scheduler").frame(),
+                        self.end_frame,
+                        life,
+                    );
+                } else {
+                    life.end(super::midi_overlay::Status::Refused);
+                }
+            }
             Command::Shutdown => return false,
             Command::SetSoundFont(sf) => {
                 self.font = Some(Arc::clone(&sf));
@@ -905,6 +951,13 @@ impl Worker {
                     }
                 }
             }
+            if self
+                .plugin_midi
+                .as_ref()
+                .is_some_and(|voice| !voice.active())
+            {
+                self.plugin_midi = None;
+            }
             if !self.playing {
                 self.render_audition_only(&mut left, &mut right, &mut inter);
                 continue;
@@ -966,6 +1019,11 @@ impl Worker {
                     Some(synth) => synth.render(&mut inter),
                     None => inter.fill(0.0),
                 }
+                if let Some(voice) = self.plugin_midi.as_mut()
+                    && !voice.mix(first, wrap.is_some(), &mut inter)
+                {
+                    self.plugin_midi = None;
+                }
                 // Audition notes are mixed in (their own synthesizer) — in
                 // Pre-Render they go to their own short ring instead.
                 if let Some(a) = self.audition.as_mut().filter(|a| a.busy() && !prerender) {
@@ -1017,6 +1075,7 @@ impl Worker {
                     self.shared
                         .ended_generation
                         .store(self.generation, Ordering::Release);
+                    self.plugin_midi = None;
                     break;
                 }
             }
@@ -1367,6 +1426,7 @@ fn spawn_worker(
         externals: Vec::new(),
         dispatcher: None,
         audition: None,
+        plugin_midi: None,
         reference: None,
     };
     let handle = std::thread::Builder::new()

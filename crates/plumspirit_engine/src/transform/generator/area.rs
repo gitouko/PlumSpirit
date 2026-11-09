@@ -521,6 +521,20 @@ impl Seg {
     }
 }
 
+/// Signed crossing of a rightward ray from `p` by the directed segment a–b.
+/// Reuses the area/pen half-open vertex rule; boundary classification is separate.
+/// Callers provide finite bounded coordinates. No geometry allocation or rasterization.
+pub fn ray_winding(a: P2, b: P2, p: P2) -> i32 {
+    let s = Seg { a, b, set: 0 };
+    // Divide the bounded y fraction first to avoid underflow for tiny local
+    // polygons. Keep the legacy rasterizer's x_at/evaluation unchanged.
+    if s.crosses(p.1) && a.0 + ((p.1 - a.1) / (b.1 - a.1)) * (b.0 - a.0) > p.0 {
+        s.dir()
+    } else {
+        0
+    }
+}
+
 /// One instance's expression: its layers' sets, its holes' set, its
 /// operations.
 #[derive(Clone, Debug, Default)]

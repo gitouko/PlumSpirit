@@ -1,0 +1,9 @@
+id = "plumspirit.example.note-exchange"
+name = "Note Exchange"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+author = "PlumSpirit contributors"
+license = "MIT"
+description = "Author-written streaming four-column note format for the first Track, with native import review and atomic export."
+capabilities = ["project.read", "notes.edit", "file.read_user_choice", "file.write_user_choice"]

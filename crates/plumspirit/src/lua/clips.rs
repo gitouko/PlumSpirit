@@ -379,7 +379,7 @@ fn track_index(w: &World, v: &Value) -> mlua::Result<usize> {
     let h = match v {
         Value::UserData(ud) => ud
             .borrow::<LuaHandle>()
-            .map(|h| h.0)
+            .map(|h| h.0.clone())
             .map_err(|_| runtime("track must be a track handle."))?,
         _ => return Err(runtime("track must be a track handle.")),
     };

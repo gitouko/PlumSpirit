@@ -107,6 +107,20 @@ pub fn working_set_bytes() -> Option<u64> {
     (ok != 0).then_some(counters.WorkingSetSize as u64)
 }
 
+/// OS process-lifetime high-water working set for isolated manual test processes.
+#[cfg(all(test, windows))]
+pub fn peak_working_set_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain correctly sized output buffer and non-owning process pseudo-handle.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    (ok != 0).then_some(counters.PeakWorkingSetSize as u64)
+}
+
 /// Private committed memory of this process (separate from its working set).
 #[cfg(windows)]
 pub fn private_commit_bytes() -> Option<u64> {

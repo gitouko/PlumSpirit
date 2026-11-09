@@ -47,6 +47,8 @@ pub enum IdKind {
     Folder,
     /// A subchannel of a track (`owner` is the track id).
     Subchannel,
+    /// A project-wide note group.
+    Group,
 }
 
 /// One followed id: kind, owner (the track of a subchannel, else 0) and id.
@@ -239,6 +241,7 @@ fn kind_code(k: IdKind) -> u64 {
         IdKind::Content => 2,
         IdKind::Folder => 3,
         IdKind::Subchannel => 4,
+        IdKind::Group => 5,
     }
 }
 
@@ -246,6 +249,7 @@ fn unpack_other(k: u64) -> IdKey {
     let kind = match k >> 32 {
         1 => IdKind::Clip,
         2 => IdKind::Content,
+        5 => IdKind::Group,
         _ => IdKind::Folder,
     };
     (kind, 0, k as u32)
@@ -267,6 +271,9 @@ fn list_other(doc: &PlumDocument) -> Vec<u64> {
     }
     for f in doc.project().folders.folders() {
         v.push(pack(IdKind::Folder, f.id));
+    }
+    for g in doc.project().groups.entries() {
+        v.push(pack(IdKind::Group, g.id));
     }
     v.sort_unstable();
     v.dedup();

@@ -9,6 +9,7 @@ pub mod duration;
 pub mod events;
 pub mod folder;
 pub mod group;
+pub mod metadata;
 pub mod note;
 pub mod note_store;
 pub mod patch;

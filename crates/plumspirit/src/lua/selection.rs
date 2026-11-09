@@ -43,7 +43,7 @@ fn arg_handle(v: &Value, what: &str) -> mlua::Result<Handle> {
     match v {
         Value::UserData(ud) => ud
             .borrow::<LuaHandle>()
-            .map(|h| h.0)
+            .map(|h| h.0.clone())
             .map_err(|_| runtime(format!("{what} must be a handle."))),
         other => Err(runtime(format!(
             "{what} must be a handle, not {}.",
@@ -183,6 +183,7 @@ pub fn install(lua: &Lua, plum: &Table) -> mlua::Result<()> {
     s.set(
         "set_tracks",
         lua.create_function(|lua, (tracks, opts): (Value, Option<Table>)| {
+            super::reactive::check_write(lua)?;
             let ids = handles_arg(&tracks, "Each track")?
                 .iter()
                 .map(|h| track_of(lua, h))
@@ -206,6 +207,7 @@ pub fn install(lua: &Lua, plum: &Table) -> mlua::Result<()> {
     s.set(
         "set_active_track",
         lua.create_function(|lua, t: Value| {
+            super::reactive::check_write(lua)?;
             let id = track_of(lua, &arg_handle(&t, "The track")?)?;
             edit_pending(lua, |p| p.active_track = Some(Some(id)));
             Ok(())
@@ -214,6 +216,7 @@ pub fn install(lua: &Lua, plum: &Table) -> mlua::Result<()> {
     s.set(
         "set_clips",
         lua.create_function(|lua, clips: Value| {
+            super::reactive::check_write(lua)?;
             let ids = handles_arg(&clips, "Each clip")?
                 .iter()
                 .map(|h| clip_of(lua, h))
@@ -225,6 +228,7 @@ pub fn install(lua: &Lua, plum: &Table) -> mlua::Result<()> {
     s.set(
         "set_time",
         lua.create_function(|lua, (a, b): (Value, Value)| {
+            super::reactive::check_write(lua)?;
             let range = match (&a, &b) {
                 (Value::Nil, Value::Nil) => None,
                 _ => {

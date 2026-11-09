@@ -102,9 +102,8 @@ pub const KEYBINDS: &[Keybind] = &[
         Command::DuplicateOctaveDown,
         "Edit",
     ),
-    // Ctrl+X: Delete Selection (v0.8 §150; arrives as a Cut event, see
-    // `PlumSpiritApp::shortcuts`). Clipboard Cut is Edit → Cut (Copy + Delete).
-    kb(CTRL, Key::X, Command::Delete, "Edit"),
+    // Ctrl+X arrives as a Cut event from egui-winit.
+    kb(CTRL, Key::X, Command::Cut, "Edit"),
     kb(CTRL, Key::Q, Command::Quantize, "Note Tools"),
     // Piano Roll mouse tools
     kb(NONE, Key::Num1, Command::Tool(Tool::Select), "Piano Roll"),
@@ -418,14 +417,16 @@ pub fn chord_text(mods: Modifiers, key: Key) -> String {
     s
 }
 
-/// What a Cut event runs, given the modifiers held: Ctrl+X (and Shift+Delete
-/// on Windows) delete the selection (v0.8 §150); on Windows Ctrl+Shift+Delete
-/// also arrives as Cut and is Delete Selected Tracks.
+/// egui-winit emits Cut for Ctrl+X and, on Windows, Shift+Delete.
 pub fn cut_command(mods: Modifiers, windows: bool) -> Command {
-    if windows && (mods.command || mods.ctrl) && mods.shift {
-        Command::DeleteSelectedTracks
+    if windows && mods.shift {
+        if mods.command || mods.ctrl {
+            Command::DeleteSelectedTracks
+        } else {
+            Command::Delete
+        }
     } else {
-        Command::Delete
+        Command::Cut
     }
 }
 
@@ -761,6 +762,7 @@ pub fn export_text() -> String {
 pub fn track_list_meaning(cmd: Command) -> Option<&'static str> {
     Some(match cmd {
         Command::Delete => "deletes the selected clips",
+        Command::Cut => "copies and removes the selected clips",
         Command::SelectAll => "selects every clip",
         Command::SliceNotes => "slices the selected clips at the edit cursor",
         Command::OpenTool("duplicate") => {
@@ -1336,8 +1338,8 @@ mod tests {
         };
         assert_eq!(cut_command(ctrl_shift, true), Command::DeleteSelectedTracks);
         assert_eq!(cut_command(Modifiers::SHIFT, true), Command::Delete);
-        assert_eq!(cut_command(Modifiers::COMMAND, true), Command::Delete);
-        assert_eq!(cut_command(ctrl_shift, false), Command::Delete);
+        assert_eq!(cut_command(Modifiers::COMMAND, true), Command::Cut);
+        assert_eq!(cut_command(ctrl_shift, false), Command::Cut);
         // The chords handled outside the table never repeat a table chord.
         for (_, chord, _) in EXTRA {
             assert!(
@@ -1369,8 +1371,7 @@ mod tests {
         let first_plain = v.iter().position(|k| !k.mods.shift).unwrap();
         assert!(v[first_plain..].iter().all(|k| !k.mods.shift));
         // Copy / Paste come from clipboard events: no table row may claim them.
-        // Ctrl+X is listed once, as Delete (v0.8 §150): it arrives as the Cut
-        // event and `PlumSpiritApp::shortcuts` runs Delete for it exactly once.
+        // Ctrl+X is listed once and routed through the Cut event.
         assert!(
             !KEYBINDS
                 .iter()
@@ -1380,11 +1381,10 @@ mod tests {
             .iter()
             .filter(|k| k.mods.command && k.key == Key::X)
             .collect();
-        assert!(
-            x.len() == 1 && x[0].command == Command::Delete && !x[0].mods.shift && !x[0].mods.alt
-        );
+        assert!(x.len() == 1 && x[0].command == Command::Cut && !x[0].mods.shift && !x[0].mods.alt);
         // Menus and tooltips show every chord of a command.
-        assert_eq!(Command::Delete.shortcut(), "Del, Ctrl+X");
+        assert_eq!(Command::Delete.shortcut(), "Del");
+        assert_eq!(Command::Cut.shortcut(), "Ctrl+X");
         assert_eq!(Command::Copy.shortcut(), "Ctrl+C");
         // The commands added in v0.8 are reachable from the keyboard.
         for c in [
@@ -1541,15 +1541,16 @@ mod tests {
                 .iter()
                 .any(|k| k.command == Command::PlayPause)
         );
-        // Ctrl+X can only stay Delete (the Cut event runs Delete).
+        // Ctrl+X is reserved for the Cut event.
         let p = set_overrides(&vec![(Command::Quantize, vec![(CTRL, Key::X)])]);
         assert_eq!(p.len(), 1, "{p:?}");
-        assert!(set_overrides(&vec![(Command::Delete, vec![(CTRL, Key::X)])]).is_empty());
-        assert_eq!(shortcuts_of(Command::Delete), vec!["Ctrl+X"]);
+        assert!(set_overrides(&vec![(Command::Cut, vec![(CTRL, Key::X)])]).is_empty());
+        assert_eq!(shortcuts_of(Command::Cut), vec!["Ctrl+X"]);
         // Back to the defaults.
         assert!(set_overrides(&Vec::new()).is_empty());
         assert_eq!(shortcuts_of(Command::Undo), vec!["Ctrl+Z"]);
-        assert_eq!(Command::Delete.shortcut(), "Del, Ctrl+X");
+        assert_eq!(Command::Delete.shortcut(), "Del");
+        assert_eq!(Command::Cut.shortcut(), "Ctrl+X");
         assert_eq!(effective().len(), KEYBINDS.len());
     }
 

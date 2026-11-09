@@ -1,0 +1,10 @@
+{
+  "crate": "harfrust",
+  "version": "0.12.0",
+  "license": "MIT",
+  "upstream_package_checksum": "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9",
+  "modified_file": "src/hb/buffer.rs",
+  "original_sha256": "0cf428118c97ccbf42df304bd029bca258f2e74b0f51f2c11e579f443c85f091",
+  "patch": "additive successful() accessor only",
+  "source_files": 71
+}

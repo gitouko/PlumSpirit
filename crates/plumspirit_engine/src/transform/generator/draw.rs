@@ -12,6 +12,9 @@
 use super::Frame;
 use super::pen::Brush;
 
+#[path = "draw_geometry.rs"]
+pub mod geometry;
+
 /// The length (grid units) of the pieces a range is cut into when its brush
 /// changes along it (gradients, taper).
 pub const UNIT: f64 = 1.0;
@@ -267,6 +270,16 @@ impl Grad {
 
 // ----- curves (lifted from Arcs, V09-S57: Custom Shape flattens its
 // Bézier edges and morphs by arc length with the same code)
+
+/// Cubic Bézier evaluation shared with Custom Shape; coefficients/order unchanged.
+pub fn cubic(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64) -> (f64, f64) {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    (
+        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+    )
+}
 
 /// The furthest a flattened curve's chord lies from the curve (grid units).
 pub const SAG: f64 = 0.05;

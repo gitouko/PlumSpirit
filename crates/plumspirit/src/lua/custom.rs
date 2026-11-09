@@ -83,6 +83,7 @@ pub enum ToolParamKind {
     NoteFilter,
     Text {
         max_len: usize,
+        multiline: bool,
     },
 }
 
@@ -144,6 +145,8 @@ pub struct ToolDecl {
     /// Apply needs selected notes (default); otherwise a run without a
     /// selection works on every note of the edited track / clip.
     pub needs_selection: bool,
+    /// Optional host Piano Roll freehand capture; absent preserves API0.1 behavior.
+    pub freehand: bool,
 }
 
 impl ToolDecl {
@@ -351,9 +354,15 @@ pub fn value_from_lua(kind: &ToolParamKind, v: &Value, what: &str) -> mlua::Resu
             }
             ToolValue::Filter(f)
         }
-        ToolParamKind::Text { max_len } => {
+        ToolParamKind::Text { max_len, multiline } => {
             let s = match v {
-                Value::String(s) => s.to_string_lossy(),
+                Value::String(s) => {
+                    if *multiline {
+                        s.to_str()?.to_string()
+                    } else {
+                        s.to_string_lossy()
+                    }
+                }
                 other => {
                     return Err(runtime(format!(
                         "{what} must be a text, not {}.",
@@ -484,8 +493,14 @@ fn param_from_lua(t: &Table, index: usize) -> mlua::Result<ToolParam> {
         "note_filter" => ToolParamKind::NoteFilter,
         "text" => {
             let n = opt_int("max_len", 200)?;
+            let multiline = match t.get::<Value>("multiline")? {
+                Value::Nil => false,
+                Value::Boolean(v) => v,
+                _ => return Err(runtime(format!("{what}: multiline must be a boolean."))),
+            };
             ToolParamKind::Text {
                 max_len: n.clamp(1, 4000) as usize,
+                multiline,
             }
         }
         other => {
@@ -579,6 +594,15 @@ fn decl_from_lua(t: &Table) -> mlua::Result<(ToolDecl, Function)> {
     let name = text_field(t, "name", "tool{}", 80, true)?;
     let tooltip = text_field(t, "tooltip", "tool{}", 400, false)?;
     let needs_selection = t.get::<Option<bool>>("needs_selection")?.unwrap_or(true);
+    let freehand = match t.get::<Value>("gesture")? {
+        Value::Nil => false,
+        Value::String(v) if v.to_str()?.as_ref() == "freehand" => true,
+        _ => {
+            return Err(runtime(
+                "tool{}: gesture must be the text freehand, or absent.",
+            ));
+        }
+    };
     let run: Function = match t.get::<Value>("run")? {
         Value::Function(f) => f,
         _ => return Err(runtime("tool{}: run must be a function.")),
@@ -591,6 +615,7 @@ fn decl_from_lua(t: &Table) -> mlua::Result<(ToolDecl, Function)> {
             tooltip,
             params,
             needs_selection,
+            freehand,
         },
         run,
     ))
@@ -792,7 +817,8 @@ pub(super) fn install(lua: &Lua, p: &Table) -> mlua::Result<()> {
                 let track = info.get::<Option<u32>>("track")?.map(TrackId);
                 let content = info.get::<Option<u32>>("content")?.map(ContentId);
                 let target = match (content, track) {
-                    (Some(c), _) => w.content(c),
+                    (Some(c), Some(t)) => w.content_on_track(c, t),
+                    (Some(c), None) => w.content(c),
                     (None, Some(t)) => w.track(t),
                     _ => None,
                 }
@@ -818,6 +844,12 @@ pub(super) fn install(lua: &Lua, p: &Table) -> mlua::Result<()> {
                 ctx.set("tool", id.as_str())?;
                 ctx.set("params", params)?;
                 ctx.set("track", target)?;
+                // Content handles retain API01 identity. Expose the captured editing
+                // owner explicitly; never infer a linked clip's owner by placement order.
+                ctx.set(
+                    "owner_track",
+                    super::handles::handle_or_nil(lua, track.and_then(|t| w.track(t)))?,
+                )?;
                 ctx.set("notes", notes)?;
                 ctx.set("selection", n_sel > 0)?;
                 ctx.set(
@@ -825,7 +857,21 @@ pub(super) fn install(lua: &Lua, p: &Table) -> mlua::Result<()> {
                     info.get::<Option<bool>>("preview")?.unwrap_or(false),
                 )?;
                 ctx.set("seed", info.get::<Option<i64>>("seed")?.unwrap_or(1))?;
-                ctx.set("keys", info.get::<Option<i64>>("keys")?.unwrap_or(128))?;
+                let keys = info.get::<Option<u16>>("keys")?.unwrap_or(128);
+                ctx.set("keys", keys)?;
+                if decl.freehand {
+                    ctx.set(
+                        "stroke",
+                        super::drawing::for_tool(
+                            lua,
+                            track
+                                .ok_or_else(|| runtime("Drawing needs an editing track."))?
+                                .0,
+                            content.map(|c| c.0),
+                            keys,
+                        )?,
+                    )?;
+                }
                 // One transaction labelled with the tool's name = one Undo step.
                 let plum: Table = lua.globals().get("plum")?;
                 let open: Function = plum.get("transaction")?;

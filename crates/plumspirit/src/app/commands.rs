@@ -228,8 +228,7 @@ pub enum Command {
     /// v0.9 §118: one-click Slice Notes — cuts the selected notes at the
     /// edit cursor, or at a ruler time selection's start and end (Ctrl+K).
     SliceNotes,
-    /// v0.8 §152: clipboard Cut (Copy, then Delete) — menu only; Ctrl+X is
-    /// Delete Selection.
+    /// Clipboard Cut publishes the selection before deleting it.
     Cut,
     /// v0.8 §153: Y-Zoom − / +.
     ZoomInY,
@@ -576,7 +575,7 @@ impl Command {
     /// Shortcut text shown next to menu items (from the central keybind
     /// registry, `app/keybinds.rs`).
     /// Every chord of the command, for menus and tooltips (v0.8 §074):
-    /// table rows first ("Del, Ctrl+X"), then the clipboard chords handled
+    /// table rows first, then the clipboard chords handled
     /// outside the table.
     pub fn shortcut(self) -> String {
         match self {

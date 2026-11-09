@@ -1,0 +1,9 @@
+id = "plumspirit.example.font-resources"
+name = "Font Resource Inspector"
+version = "1.0.1"
+api = "0.2"
+entry = "main.lua"
+description = "Author-written native installed-font chooser, bounded scalar outline preview, presets and font resource inspection."
+author = "PlumSpirit"
+license = "MIT"
+capabilities = ["file.read_user_choice", "fonts.list", "ui.panels"]

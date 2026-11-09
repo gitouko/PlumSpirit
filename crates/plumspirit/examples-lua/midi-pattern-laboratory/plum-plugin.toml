@@ -1,0 +1,7 @@
+id = "plumspirit.example.midi-pattern-laboratory"
+name = "MIDI Pattern Laboratory"
+version = "1.0.0"
+api = "0.2"
+entry = "main.lua"
+capabilities = ["playback.read", "playback.emit_midi"]
+description = "Author-written precomputed MIDI patterns on isolated native internal voices."
